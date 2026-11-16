@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NDC · Booking failures</title>
+<script>document.documentElement.dataset.theme = localStorage.getItem('nb-theme') || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');</script>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header class="bar">
+  <div class="brand"><div class="logo">NB</div>NDC · Not Booked Investigation</div>
+  <nav class="tabs"><a href="/">Cases</a><a href="/failures" aria-current="page">Booking failures</a><a href="/exceptions">Exceptions</a></nav>
+  <div class="sp"></div>
+  <span class="muted" style="font-size:12.5px">ndc-core-backend-log · read-only</span>
+  <button class="iconbtn" id="themeBtn" title="Toggle light / dark"></button>
+</header>
+
+<main>
+  <section class="card">
+    <form id="f" class="card-b" autocomplete="off" style="display:flex;gap:14px;align-items:end;flex-wrap:wrap">
+      <div class="field">
+        <span>Time range</span>
+        <div class="seg" id="presets">
+          <button type="button" data-h="24" aria-pressed="true">24h</button><button type="button" data-h="72">3d</button>
+          <button type="button" data-h="168">7d</button><button type="button" data-h="720">30d</button>
+        </div>
+      </div>
+      <label class="field"><span>From</span><input type="datetime-local" name="from"></label>
+      <label class="field"><span>To</span><input type="datetime-local" name="to"></label>
+      <label class="field"><span>Agency <span class="muted" style="font-weight:400">optional</span></span><input type="text" name="agency" placeholder="AGN12210" list="agList"></label>
+      <label class="field"><span>Supplier <span class="muted" style="font-weight:400">optional</span></span><input type="text" name="supplier" placeholder="Galileo" list="supList"></label>
+      <button class="primary" id="go"><span id="goTxt">Load failures</span></button>
+      <datalist id="agList"></datalist><datalist id="supList"></datalist>
+    </form>
+    <div class="card-b hint" style="padding-top:0">Failed bookings = <span class="mono">handleBookingException</span> ("Booking Has been failed!"),
+      <span class="mono">logBookingFailedBeforeSupplierCall</span> and <span class="mono">processMakePayment</span> errors, joined per session and booking ref.
+      Agency and supplier come from the same session. Times are your local time.</div>
+    <div id="err" class="err card-b" style="padding-top:0" hidden></div>
+  </section>
+
+  <div id="out" style="display:grid;gap:16px">
+    <section class="card"><div class="empty"><div class="big">Loading the last 24 hours…</div></div></section>
+  </div>
+</main>
+<div class="tip" id="tip"></div>
+<div class="toast" id="toast"></div>
+
+<script src="/common.js"></script>
+<script>
+const toLocal = (d) => new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+const preset = (h) => { $('[name=from]').value = toLocal(new Date(Date.now() - h * 3600e3)); $('[name=to]').value = toLocal(new Date());
+  document.querySelectorAll('#presets button').forEach(b => b.setAttribute('aria-pressed', String(+b.dataset.h === h))); };
+$('#presets').onclick = (e) => { if (e.target.dataset.h) { preset(+e.target.dataset.h); load(); } };
+$('#f').addEventListener('submit', (e) => { e.preventDefault(); load(); });
+
+let data = null; const filt = { category: null, agency: null, supplier: null };
+
+async function load() {
+  const from = new Date($('[name=from]').value), to = new Date($('[name=to]').value);
+  const agency = $('[name=agency]').value.trim(), supplier = $('[name=supplier]').value.trim();
+  const p = new URLSearchParams({ from: from.toISOString(), to: to.toISOString() }); if (agency) p.set('agency', agency); if (supplier) p.set('supplier', supplier);
+  history.replaceState(null, '', '?' + p);
+  const go = $('#go'); go.disabled = true; go.prepend(el('span', { className: 'spinner' })); $('#goTxt').textContent = 'Loading…'; $('#err').hidden = true;
+  try { data = await api('/api/failures?' + p); data.agency = agency; data.supplier = supplier; filt.category = filt.agency = filt.supplier = null; render(); }
+  catch (e) { $('#err').hidden = false; $('#err').textContent = '⚠ ' + e.message; }
+  finally { go.disabled = false; $('.spinner', go)?.remove(); $('#goTxt').textContent = 'Load failures'; }
+}
+
+const count = (rows, f) => { const m = new Map(); rows.forEach(r => { for (const k of [].concat(f(r))) if (k) m.set(k, (m.get(k) || 0) + 1); }); return [...m.entries()].sort((a, b) => b[1] - a[1]); };
+const UNK = '(unknown)';
+const shown = () => data.rows.filter(r => (!filt.category || r.category === filt.category)
+  && (!filt.agency || (filt.agency === UNK ? !r.agencyCode : r.agencyCode === filt.agency))
+  && (!filt.supplier || (filt.supplier === UNK ? !r.supplier : r.supplier === filt.supplier)));
+
+function render() {
+  const all = data.rows; const rows = shown();
+  // Colour follows the reason (top 5 real reasons); "unclassified" is always neutral, the rest fold into "Other reasons".
+  const UNCL = 'Other / unclassified';
+  const cats = count(all, r => r.category); const topCats = cats.map(c => c[0]).filter(c => c !== UNCL).slice(0, 5);
+  const colorOf = (c) => c === UNCL ? 'var(--s-nostack)' : topCats.includes(c) ? `var(--s${topCats.indexOf(c) + 1})` : 'var(--s-other)';
+  $('#agList').replaceChildren(...count(all, r => r.agencyCode).slice(0, 100).map(([k]) => el('option', { value: k })));
+  $('#supList').replaceChildren(...count(all, r => r.supplier.split(/,\s*/)).map(([k]) => el('option', { value: k })));
+  const out = [];
+  /* tiles */
+  const refs = new Set(rows.map(r => r.ref).filter(Boolean)).size, ags = new Set(rows.map(r => r.agencyCode).filter(Boolean)).size;
+  const rc = count(rows, r => r.category)[0];
+  const active = Object.entries(filt).filter(([, v]) => v);
+  out.push(el('section', { className: 'card' },
+    el('div', { className: 'card-h' }, el('h2', {}, 'Overview'),
+      el('span', { className: 'muted', style: { fontSize: '12.5px' } }, `${fmtDate(data.from)} → ${fmtDate(data.to)}${data.agency ? ' · agency ' + data.agency : ''}${data.supplier ? ' · supplier ' + data.supplier : ''}`),
+      active.length ? el('span', { className: 'chips' }, active.map(([k, v]) => { const c = el('button', { type: 'button', className: 'chip', title: 'Remove filter' }, `${k}: ${v} ✕`); c.onclick = () => { filt[k] = null; render(); }; return c; })) : null,
+      el('div', { style: { flex: 1 } }),
+      el('button', { className: 'iconbtn', type: 'button', onclick: sendFailures }, '💬 Send to team leader'),
+      el('button', { className: 'iconbtn', type: 'button', onclick: exportPdf }, '⤓ Export PDF'),
+      el('button', { className: 'iconbtn', type: 'button', onclick: exportCsv }, '⤓ Export CSV')),
+    el('div', { className: 'card-b' },
+      el('div', { className: 'tiles' },
+        tile('Failed bookings', rows.length.toLocaleString(), 'var(--critical)', data.truncated ? 'limit reached – narrow the range' : `${data.events.toLocaleString()} log events`),
+        tile('Booking refs', refs.toLocaleString()), tile('Agencies affected', ags.toLocaleString()),
+        tile('Top reason', rc ? rc[0] : '—', rc ? colorOf(rc[0]) : null, rc ? `${rc[1]} · ${Math.round(rc[1] / rows.length * 100)}%` : ''),
+        tile('Banque Misr sessions', rows.filter(r => r.banqueMisr).length.toLocaleString(), 'var(--serious)', 'counted as not booked')),
+      el('div', { style: { marginTop: '14px' } }, chart(rows, topCats, colorOf)))));
+  /* breakdowns */
+  const bl = (title, items, key, label, colorFn) => el('section', { className: 'card' }, el('div', { className: 'card-h' }, el('h2', {}, title), el('span', { className: 'muted', style: { fontSize: '12px' } }, 'click to filter')),
+    el('div', { className: 'card-b' }, barList2(items.slice(0, 12), (k) => { filt[key] = filt[key] === k ? null : k; render(); }, label, colorFn, filt[key])));
+  out.push(el('div', { className: 'grid3' },
+    bl('By reason', count(rows, r => r.category), 'category', k => k, colorOf),
+    bl('By agency', count(rows, r => r.agencyCode || '(unknown)'), 'agency', k => { const r = rows.find(x => x.agencyCode === k); return r && r.agencyName ? `${k} · ${r.agencyName}` : k; }),
+    bl('By supplier', count(rows, r => r.supplier ? r.supplier.split(/,\s*/) : '(unknown)'), 'supplier', k => k)));
+  /* messages no rule recognises yet: candidates for new rules in rules.js */
+  const uncl = count(rows.filter(r => r.category === 'Other / unclassified'), r => r.reason.slice(0, 220));
+  if (uncl.length) out.push(el('section', { className: 'card' },
+    el('div', { className: 'card-h' }, el('h2', {}, `Unclassified messages (${uncl.length} distinct)`),
+      el('span', { className: 'muted', style: { fontSize: '12.5px' } }, 'No rule recognises these yet – add rules in rules.js for the frequent ones')),
+    el('table', { className: 'tbl' }, el('thead', {}, el('tr', {}, ['Count', 'Message', 'Suppliers'].map(h => el('th', { textContent: h })))),
+      el('tbody', {}, uncl.slice(0, 25).map(([msg, n]) => el('tr', {}, el('td', { className: 'num', style: { fontWeight: 700 } }, String(n)),
+        el('td', { className: 'mono', style: { fontSize: '12px' } }, msg, copyBtn(msg)),
+        el('td', { className: 'ink2' }, [...new Set(rows.filter(r => r.category === 'Other / unclassified' && r.reason.slice(0, 220) === msg).map(r => r.supplier).filter(Boolean))].join(', ') || '—')))))));
+  /* table */
+  const LIMIT = 300; let limit = LIMIT;
+  const tbody = el('tbody'); const more = el('div', { className: 'card-b' });
+  const fill = () => {
+    tbody.replaceChildren(...rows.slice(0, limit).map(r => el('tr', {},
+      el('td', { className: 'num', style: { whiteSpace: 'nowrap' } }, fmtDate(r.time), r.count > 1 ? el('div', { className: 'muted', style: { fontSize: '12px' } }, `${r.count}× until ${fmtTime(r.last).slice(0, 5)}`) : null),
+      el('td', { className: 'mono' }, r.ref || el('span', { className: 'muted' }, '—'), r.ref ? copyBtn(r.ref) : null),
+      el('td', {}, el('div', { style: { fontWeight: 600 } }, r.agencyCode || '—'), el('div', { className: 'muted', style: { fontSize: '12.5px' } }, r.agencyName)),
+      el('td', { className: 'ink2' }, el('div', { style: { fontWeight: 600 } }, r.supplier || '—'),
+        (r.sessionSuppliers || []).filter(x => x !== r.supplier).length ? el('div', { className: 'muted', style: { fontSize: '12px' }, title: 'Other suppliers called in the same session' }, 'session: ' + r.sessionSuppliers.filter(x => x !== r.supplier).join(', ')) : null,
+        r.banqueMisr ? el('div', {}, el('span', { className: 'pill', style: { '--c': 'var(--serious)' } }, el('span', { className: 'ico', textContent: '✕' }), 'Banque Misr')) : null),
+      el('td', {}, el('div', { style: { display: 'flex', gap: '6px', alignItems: 'center' } }, el('span', { className: 'swatch', style: { background: colorOf(r.category) } }), el('b', {}, r.category)),
+        el('div', { className: 'ink2', style: { fontSize: '13px', marginTop: '2px' } }, r.reason)),
+      el('td', { className: 'ink2', style: { fontSize: '12.5px', maxWidth: '280px' } }, r.action),
+      el('td', { style: { whiteSpace: 'nowrap' } },
+        r.ref ? el('a', { className: 'linkbtn', href: '/?refs=' + encodeURIComponent(`${r.ref} ${fmtDate(r.time)}`), style: { textDecoration: 'none' } }, 'Case →') : null, ' ',
+        el('a', { className: 'linkbtn', href: '/exceptions?cid=' + encodeURIComponent(r.cid), style: { textDecoration: 'none' } }, 'Explain →')))));
+    more.replaceChildren(rows.length > limit ? el('button', { type: 'button', className: 'iconbtn', onclick: () => { limit += LIMIT; fill(); } }, `Show more (${rows.length - limit} left)`) : el('span', { className: 'muted' }, `${rows.length} row(s)`));
+  };
+  fill();
+  out.push(el('section', { className: 'card' },
+    el('div', { className: 'card-h' }, el('h2', {}, 'Failed bookings'), el('span', { className: 'muted' }, `${rows.length} of ${all.length}`)),
+    el('table', { className: 'tbl' }, el('thead', {}, el('tr', {}, ['Time', 'Booking ref', 'Agency', 'Supplier', 'Reason', 'What to do', ''].map(h => el('th', { textContent: h })))), tbody), more));
+  $('#out').replaceChildren(...out);
+}
+
+function tile(label, value, color, sub) {
+  return el('div', { className: 'tile static', style: color ? { '--c': color } : {} }, el('div', { className: 'lab' }, label),
+    el('div', { className: 'val num', style: { fontSize: String(value).length > 14 ? '15px' : '26px' } }, value), sub ? el('div', { className: 'muted', style: { fontSize: '12px' } }, sub) : null);
+}
+
+function barList2(items, onClick, label, colorFn, selected) {
+  const max = Math.max(1, ...items.map(i => i[1]));
+  if (!items.length) return el('div', { className: 'muted' }, 'No data');
+  return el('div', { className: 'barlist' }, items.map(([k, n]) => { const row = el('div', { className: 'bl-row click' + (selected === k ? ' sel' : ''), title: k },
+    el('div', { className: 'bl-lab', style: { fontFamily: 'inherit' } }, colorFn ? el('span', { className: 'swatch', style: { background: colorFn(k) } }) : null, label(k)),
+    el('div', { className: 'bl-track' }, el('div', { className: 'bl-bar', style: { width: (n / max * 100) + '%', background: colorFn ? colorFn(k) : 'var(--s1)' } })),
+    el('div', { className: 'bl-val num', textContent: n.toLocaleString() }));
+    row.onclick = () => onClick(k); return row; }));
+}
+
+/* stacked bars over time by reason (top 5 + Other), hover shows the breakdown */
+function chart(rows, topCats, colorOf) {
+  const t0 = Date.parse(data.from), t1 = Date.parse(data.to); const spanH = (t1 - t0) / 3600e3;
+  const step = spanH <= 72 ? 3600e3 : 86400e3;
+  const start = step === 3600e3 ? Math.floor(t0 / step) * step : new Date(new Date(t0).setHours(0, 0, 0, 0)).getTime();
+  const n = Math.max(1, Math.ceil((t1 - start) / step));
+  const UNCL = 'Other / unclassified';
+  const keys = [...topCats, 'Other reasons', UNCL];
+  const bins = Array.from({ length: n }, (_, i) => ({ t: start + i * step, total: 0, parts: Object.fromEntries(keys.map(k => [k, 0])) }));
+  rows.forEach(r => { const i = Math.floor((Date.parse(r.time) - start) / step); if (bins[i]) { const k = topCats.includes(r.category) || r.category === UNCL ? r.category : 'Other reasons'; bins[i].parts[k]++; bins[i].total++; } });
+  const W = 1100, H = 200, P = { l: 40, r: 8, t: 8, b: 24 }, iw = W - P.l - P.r, ih = H - P.t - P.b;
+  const max = Math.max(1, ...bins.map(b => b.total)); const ymax = max <= 5 ? 5 : Math.ceil(max / 5) * 5;
+  const bw = iw / n, barW = Math.max(2, Math.min(26, bw - 2)); const y = v => P.t + ih - v / ymax * ih;
+  const NS = 'http://www.w3.org/2000/svg'; const s = (tag, a, ...k) => { const e = document.createElementNS(NS, tag); for (const [x, v] of Object.entries(a)) e.setAttribute(x, v); k.forEach(c => e.append(c)); return e; };
+  const svg = s('svg', { viewBox: `0 0 ${W} ${H}`, class: 'hchart', role: 'img', 'aria-label': `Failed bookings over time, ${rows.length} total` });
+  [0, .5, 1].forEach(f => { const yy = y(ymax * f); svg.append(s('line', { x1: P.l, x2: W - P.r, y1: yy, y2: yy, class: f ? 'grid' : 'axis' }), s('text', { x: P.l - 6, y: yy + 4, 'text-anchor': 'end', class: 'tick' }, document.createTextNode(Math.round(ymax * f)))); });
+  const every = Math.max(1, Math.ceil(n / 10));
+  bins.forEach((b, i) => {
+    if (i % every === 0) { const d = new Date(b.t); svg.append(s('text', { x: P.l + i * bw + bw / 2, y: H - 6, 'text-anchor': 'middle', class: 'tick' }, document.createTextNode(step === 3600e3 ? `${pad(d.getDate())}/${pad(d.getMonth() + 1)} ${pad(d.getHours())}h` : `${pad(d.getDate())}/${pad(d.getMonth() + 1)}`))); }
+    let acc = 0; const x = P.l + i * bw + (bw - barW) / 2;
+    keys.forEach(k => { const v = b.parts[k]; if (!v) return; const y0 = y(acc), y1 = y(acc + v); acc += v; svg.append(s('rect', { x, y: y1, width: barW, height: Math.max(.5, y0 - y1 - 1), fill: colorOf(k === 'Other reasons' ? '__other__' : k) })); });
+    const hit = s('rect', { x: P.l + i * bw, y: P.t, width: bw, height: ih, fill: 'transparent', class: 'hit' });
+    hit.addEventListener('mousemove', (e) => { tip.replaceChildren(el('b', {}, `${fmtDate(b.t)}${step === 3600e3 ? '' : ' (day)'}`), el('div', {}, `${b.total} failed booking(s)`),
+      ...keys.filter(k => b.parts[k]).map(k => el('div', { style: { display: 'flex', gap: '6px', alignItems: 'center' } }, el('span', { className: 'swatch', style: { background: colorOf(k === 'Other reasons' ? '__other__' : k) } }), `${k}: ${b.parts[k]}`)));
+      tip.style.opacity = 1; tip.style.left = Math.min(e.clientX + 14, innerWidth - tip.offsetWidth - 8) + 'px'; tip.style.top = (e.clientY + 16) + 'px'; });
+    hit.addEventListener('mouseleave', () => tip.style.opacity = 0);
+    svg.append(hit);
+  });
+  const legend = el('div', { className: 'legend' }, keys.map(k => el('span', { className: 'lg' }, el('span', { className: 'swatch', style: { background: colorOf(k === 'Other reasons' ? '__other__' : k) } }), k)));
+  return el('div', {}, el('div', { className: 'muted', style: { fontSize: '12.5px', marginBottom: '6px' } }, `Failed bookings per ${step === 3600e3 ? 'hour' : 'day'}, by reason`), legend, svg);
+}
+
+/* exports */
+const COLS = [{ key: 'time', label: 'Time', time: true, width: '11%' }, { key: 'ref', label: 'Booking ref', mono: true, width: '14%' }, { key: 'agency', label: 'Agency', width: '13%' },
+  { key: 'supplier', label: 'Supplier', width: '9%' }, { key: 'category', label: 'Reason', width: '15%' }, { key: 'reason', label: 'Message' }, { key: 'action', label: 'What to do', width: '20%' }];
+const flat = (r) => ({ ...r, agency: [r.agencyCode, r.agencyName].filter(Boolean).join(' · '), supplier: r.supplier + (r.banqueMisr ? ' (Banque Misr)' : '') });
+function exportCsv() {
+  const q = (v) => '"' + String(v ?? '').replace(/"/g, '""') + '"';
+  const head = ['time_local', 'last_local', 'count', 'booking_ref', 'agency_code', 'agency_name', 'supplier', 'banque_misr', 'reason_category', 'message', 'what_to_do', 'sources', 'correlation_id', 'server'];
+  const lines = [head.join(','), ...shown().map(r => [fmtDate(r.time), fmtDate(r.last), r.count, r.ref, r.agencyCode, r.agencyName, r.supplier, r.banqueMisr ? 'yes' : '', r.category, r.reason, r.action, r.sources.join(' '), r.cid, r.host].map(q).join(','))];
+  const a = el('a', { href: URL.createObjectURL(new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv' })), download: `booking-failures-${new Date().toISOString().slice(0, 16).replace('T', '_').replace(':', '')}.csv` });
+  a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+function failuresReport() {
+  const rows = shown(); const cats = count(rows, r => r.category).slice(0, 5);
+  return { title: 'NDC – Booking failures', tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    subtitle: `${fmtDate(data.from)} → ${fmtDate(data.to)}` + Object.entries(filt).filter(([, v]) => v).map(([k, v]) => ` · ${k}: ${v}`).join('') + (data.agency ? ` · agency ${data.agency}` : '') + (data.supplier ? ` · supplier ${data.supplier}` : ''),
+    summary: [['Failed bookings', rows.length], ['Booking refs', new Set(rows.map(r => r.ref).filter(Boolean)).size], ['Agencies', new Set(rows.map(r => r.agencyCode).filter(Boolean)).size], ...cats.map(([k, v]) => [k, v])],
+    columns: COLS, rows: rows.map(flat), footer: 'Sources: handleBookingException, logBookingFailedBeforeSupplierCall, processMakePayment errors (ndc-core-backend-log). Times in ' + Intl.DateTimeFormat().resolvedOptions().timeZone + '.' };
+}
+function sendFailures() {
+  const rep = failuresReport(); const rows = shown();
+  const top = count(rows, r => r.category).slice(0, 5).map(([k, v]) => `- ${k}: ${v}`).join('\n');
+  sendToTeamLeader({ report: rep, comment: `Booking failures ${rep.subtitle}\n\nFailed bookings: ${rows.length} (refs: ${rep.summary[1][1]}, agencies: ${rep.summary[2][1]})\nTop reasons:\n${top}\n\nDetails in the attached PDF.` });
+}
+async function exportPdf(ev) {
+  const btn = ev.currentTarget; btn.disabled = true; const old = btn.textContent; btn.textContent = 'Building PDF…';
+  try {
+    const payload = failuresReport();
+    const res = await fetch('/api/export/pdf', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.status);
+    const a = el('a', { href: URL.createObjectURL(await res.blob()), download: `booking-failures-${new Date().toISOString().slice(0, 16).replace('T', '_').replace(':', '')}.pdf` });
+    a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 10000); toast('PDF downloaded');
+  } catch (e) { toast('⚠ PDF export failed: ' + e.message); }
+  finally { btn.disabled = false; btn.textContent = old; }
+}
+
+/* init: from URL or last 24h */
+const QS = new URLSearchParams(location.search);
+if (QS.get('theme')) setTheme(QS.get('theme'));
+if (QS.get('from')) { $('[name=from]').value = toLocal(new Date(QS.get('from'))); $('[name=to]').value = toLocal(new Date(QS.get('to') || Date.now()));
+  document.querySelectorAll('#presets button').forEach(b => b.setAttribute('aria-pressed', 'false')); } else preset(24);
+$('[name=agency]').value = QS.get('agency') || ''; $('[name=supplier]').value = QS.get('supplier') || '';
+load();
+</script>
+</body>
+</html>

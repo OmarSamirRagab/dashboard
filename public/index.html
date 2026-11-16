@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NDC · Not Booked Investigation</title>
+<script>document.documentElement.dataset.theme = localStorage.getItem('nb-theme') || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');</script>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header class="bar">
+  <div class="brand"><div class="logo">NB</div>NDC · Not Booked Investigation</div>
+  <nav class="tabs"><a href="/" aria-current="page">Cases</a><a href="/failures">Booking failures</a><a href="/exceptions">Exceptions</a></nav>
+  <div class="sp"></div>
+  <span class="muted" style="font-size:12.5px">ndc-core-backend-log · read-only</span>
+  <button class="iconbtn" id="themeBtn" title="Toggle light / dark"></button>
+</header>
+
+<main>
+  <!-- search -->
+  <section class="card">
+    <form id="f" class="card-b search" autocomplete="off">
+      <label class="field">
+        <span>Booking reference + creation time <span class="count" id="refCount" hidden></span> <span class="count" id="timeCount" hidden></span></span>
+        <textarea name="refs" rows="6" placeholder="One per line: booking ref, then creation time (paste from Excel is fine)&#10;NDCEG-BR-F261109TyCsIl   2026-11-09 16:53&#10;NDCEG-BR-F261108XWLxWe   08/11/2026 12:50&#10;NDCEG-BR-F261112Qr8UGd   (no time = search the ref's whole day)"></textarea>
+        <div class="hint">Time formats: <span class="mono">2026-11-09 16:53</span> or <span class="mono">09/11/2026 16:53</span> (day first), seconds optional, your local time.</div>
+      </label>
+      <label class="field">
+        <span>Agency <span class="muted" style="font-weight:400">optional</span></span>
+        <input type="text" name="agency" placeholder="AGN12210 or exact name">
+        <span class="hint">With refs: keeps only that agency's sessions. Alone: lists its payment attempts.</span>
+      </label>
+      <div class="field">
+        <span>Time range</span>
+        <div class="win">Refs with a creation time: search from
+          <input type="number" name="before" value="60" min="5" max="1440" aria-label="minutes before"> min before to
+          <input type="number" name="after" value="120" min="5" max="1440" aria-label="minutes after"> min after it</div>
+        <label class="switch"><input type="checkbox" name="autoRange" checked> Refs without a time: use the ref's date <span class="muted">(−1 … +3 days)</span></label>
+        <div class="dates" id="dates">
+          <input type="datetime-local" name="from" aria-label="From">
+          <input type="datetime-local" name="to" aria-label="To">
+        </div>
+        <div class="seg" id="presets">
+          <button type="button" data-h="24">24h</button><button type="button" data-h="72">3d</button>
+          <button type="button" data-h="168">7d</button><button type="button" data-h="720">30d</button>
+        </div>
+      </div>
+      <div class="field">
+        <span>&nbsp;</span>
+        <button class="primary" id="go"><span id="goTxt">Find cases</span></button>
+        <span class="hint"><kbd>Ctrl</kbd>+<kbd>Enter</kbd></span>
+      </div>
+    </form>
+    <div id="err" class="err card-b" style="padding-top:0" hidden></div>
+  </section>
+
+  <!-- overview -->
+  <section class="card" id="overview" hidden>
+    <div class="card-h"><h2>Overview</h2><span class="muted" id="ovSub"></span><div style="flex:1"></div>
+      <button class="iconbtn" id="azdo" type="button">💬 Send to team leader</button>
+      <button class="iconbtn" id="pdf" type="button">⤓ Export PDF</button>
+      <button class="iconbtn" id="csv" type="button">⤓ Export CSV</button></div>
+    <div class="card-b">
+      <div class="tiles" id="tiles"></div>
+      <div class="distbar" id="dist" role="img"></div>
+      <div class="notices" id="notices"></div>
+    </div>
+  </section>
+
+  <!-- cases -->
+  <section class="card" id="casesCard">
+    <div class="card-h"><h2>Cases</h2><span class="muted" id="caseSub"></span></div>
+    <div id="casesWrap">
+      <div class="empty"><div class="big">Paste booking references and press Find cases</div>
+        Each session is checked for where the booking stopped: search → fare → passengers → reprice → payment → supplier booking.</div>
+    </div>
+  </section>
+</main>
+
+<div class="scrim" id="scrim"></div>
+<aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-label="Case timeline">
+  <div class="dh" id="dh"></div>
+  <div class="db" id="db"></div>
+</aside>
+<div class="tip" id="tip"></div>
+<div class="toast" id="toast"></div>
+
+<script src="/common.js"></script>
+<script>
+/* form */
+const toLocal = (d) => new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+const preset = (h) => { $('[name=from]').value = toLocal(new Date(Date.now() - h * 3600e3)); $('[name=to]').value = toLocal(new Date());
+  document.querySelectorAll('#presets button').forEach(b => b.setAttribute('aria-pressed', String(+b.dataset.h === h))); };
+preset(24);
+$('#presets').onclick = (e) => { if (e.target.dataset.h) { preset(+e.target.dataset.h); $('[name=autoRange]').checked = false; syncDates(); } };
+const syncDates = () => { const it = parseItems($('[name=refs]').value);
+  const auto = it.length && it.every(x => x.created || $('[name=autoRange]').checked);
+  $('#dates').classList.toggle('off', !!auto); $('#presets').classList.toggle('off', !!auto); };
+$('[name=autoRange]').onchange = syncDates;
+const parseRefs = (s) => parseItems(s).map(x => x.ref);
+// "REF  2026-11-09 16:53[:ss]" or "REF  09/11/2026 16:53 [PM]" (day first) – local time. Lines without a time may hold several refs.
+function parseTime(s) {
+  let m = /(\d{4})-(\d{1,2})-(\d{1,2})[ T]+(\d{1,2}):(\d{2})(?::(\d{2}))?/.exec(s);
+  if (m) return new Date(+m[1], m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0));
+  m = /(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{4})[ T]+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?/i.exec(s);
+  if (m) { let h = +m[4]; if (m[7]) { const pm = /pm/i.test(m[7]); if (pm && h < 12) h += 12; if (!pm && h === 12) h = 0; }
+    return new Date(+m[3], m[2] - 1, +m[1], h, +m[5], +(m[6] || 0)); }
+  return null;
+}
+function parseItems(text) {
+  const out = []; const seen = new Set();
+  for (const line of String(text || '').split(/\r?\n/)) {
+    const t = parseTime(line);
+    const tokens = line.replace(/\d{4}-\d{1,2}-\d{1,2}[ T]+\d{1,2}:\d{2}(:\d{2})?|\d{1,2}[\/.-]\d{1,2}[\/.-]\d{4}[ T]+\d{1,2}:\d{2}(:\d{2})?\s*(AM|PM)?/gi, ' ')
+      .split(/[\s,;|]+/).map(x => x.trim()).filter(x => /^[A-Za-z0-9][\w-]{5,}$/.test(x) && /[A-Za-z]/.test(x));
+    const refs = t ? tokens.slice(0, 1) : tokens;
+    for (const ref of refs) { const created = t && !isNaN(t) ? t.toISOString() : null; const k = ref + '|' + created;
+      if (!seen.has(k)) { seen.add(k); out.push({ ref, created }); } }
+  }
+  return out;
+}
+$('[name=refs]').addEventListener('input', (e) => { const it = parseItems(e.target.value); const c = $('#refCount'); c.hidden = !it.length; c.textContent = `${it.length} ref${it.length === 1 ? '' : 's'}`;
+  const nt = it.filter(x => x.created).length; const t = $('#timeCount'); t.hidden = !nt; t.textContent = `${nt} with time`; syncDates(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) $('#f').requestSubmit(); if (e.key === 'Escape') closeDrawer(); });
+syncDates();
+
+
+let result = null; const hidden = new Set();
+$('#f').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const fd = new FormData(ev.target); const items = parseItems(fd.get('refs')); const refs = items.map(x => x.ref);
+  const body = { items, refs, agency: fd.get('agency').trim(), autoRange: !!fd.get('autoRange'), before: +fd.get('before') || 60, after: +fd.get('after') || 120,
+    from: new Date(fd.get('from')).toISOString(), to: new Date(fd.get('to')).toISOString() };
+  const go = $('#go'); go.disabled = true; go.prepend(el('span', { className: 'spinner' })); $('#goTxt').textContent = refs.length > 1 ? `Searching ${refs.length} refs…` : 'Searching…';
+  $('#err').hidden = true; const t0 = Date.now();
+  const u = new URLSearchParams(); if (refs.length) u.set('refs', items.map(x => x.created ? `${x.ref} ${fmtDate(x.created)}` : x.ref).join('\n')); if (body.agency) u.set('agency', body.agency);
+  if (!body.autoRange || !refs.length) { u.set('from', body.from); u.set('to', body.to); }
+  history.replaceState(null, '', '?' + u);
+  try { result = await api('/api/cases', body); result.took = (Date.now() - t0) / 1000; result.query = body; hidden.clear(); render();
+    if (result.rows.length === 1) openCase(result.rows[0]); }
+  catch (e) { $('#err').hidden = false; $('#err').textContent = '⚠ ' + e.message; }
+  finally { go.disabled = false; $('.spinner', go)?.remove(); $('#goTxt').textContent = 'Find cases'; }
+});
+
+function render() {
+  const { rows, notFound, otherAgency, searched, took } = result;
+  const byRef = rows.some(r => r.ref);
+  const refsWith = new Set(rows.map(r => r.ref)).size;
+  /* overview */
+  $('#overview').hidden = false;
+  $('#ovSub').textContent = byRef ? `${searched} ref(s) · ${took.toFixed(1)}s` : `agency search · ${took.toFixed(1)}s`;
+  const counts = {}; rows.forEach(r => counts[r.kind] = (counts[r.kind] || 0) + 1);
+  const kinds = ORDER.filter(k => counts[k]);
+  const tiles = [];
+  if (byRef) tiles.push(el('div', { className: 'tile static' }, el('div', { className: 'lab' }, 'Refs with logs'),
+    el('div', { className: 'val num' }, String(refsWith), el('small', {}, `/ ${searched}`))));
+  tiles.push(el('div', { className: 'tile static' }, el('div', { className: 'lab' }, 'Sessions'), el('div', { className: 'val num', textContent: rows.length })));
+  for (const k of kinds) { const K = KINDS[k];
+    const t = el('button', { type: 'button', className: 'tile', style: { '--c': K.c }, 'aria-pressed': String(!hidden.has(k)), title: 'Click to show / hide' },
+      el('div', { className: 'lab' }, el('span', { className: 'ico' + (K.dark ? ' dark-ink' : ''), style: { background: K.c }, textContent: K.i }), K.label),
+      el('div', { className: 'val num' }, String(counts[k]), el('small', {}, `${Math.round(counts[k] / rows.length * 100)}%`)));
+    t.onclick = () => { hidden.has(k) ? hidden.delete(k) : hidden.add(k); render(); }; tiles.push(t); }
+  $('#tiles').replaceChildren(...tiles);
+  $('#dist').replaceChildren(...kinds.map(k => { const d = el('div', { style: { '--c': KINDS[k].c, flex: counts[k] } });
+    hoverTip(d, () => [el('b', {}, KINDS[k].label), el('div', {}, `${counts[k]} session(s) · ${Math.round(counts[k] / rows.length * 100)}%`)]); return d; }));
+  $('#dist').setAttribute('aria-label', kinds.map(k => `${KINDS[k].label} ${counts[k]}`).join(', '));
+  const nts = [];
+  if (notFound.length) nts.push(el('div', { className: 'notice' }, el('b', {}, `Not found · ${notFound.length}`),
+    el('div', { className: 'chips' }, notFound.map(n => el('span', { className: 'chip', textContent: n.ref || 'agency search' }))),
+    el('span', { className: 'muted', style: { marginLeft: 'auto', whiteSpace: 'nowrap' } }, 'no logs in their window – older than ~30 days, typo, or widen the range')));
+  if (otherAgency.length) nts.push(el('div', { className: 'notice' }, el('b', {}, `Other agency · ${otherAgency.length}`),
+    el('div', { className: 'chips' }, otherAgency.map(o => el('span', { className: 'chip', textContent: `${o.ref} → ${o.agencies.join('/') || '?'}` })))));
+  $('#notices').replaceChildren(...nts);
+
+  /* table */
+  const shown = rows.filter(r => !hidden.has(r.kind));
+  $('#caseSub').textContent = `${shown.length} of ${rows.length} session(s)` + (!byRef && rows.length === 50 ? ' · max 50, narrow the time range' : '');
+  if (!rows.length) { $('#casesWrap').replaceChildren(el('div', { className: 'empty' }, el('div', { className: 'big' }, 'No sessions found'), 'Check the references and the time range.')); return; }
+  const tb = el('tbody');
+  let prev = null;
+  for (const c of shown) {
+    if (byRef && c.ref + c.created !== prev) { prev = c.ref + c.created; const n = shown.filter(x => x.ref === c.ref && x.created === c.created).length;
+      tb.append(el('tr', { className: 'grp' }, el('td', { colSpan: 6 }, el('span', { className: 'mono ref', textContent: c.ref }), copyBtn(c.ref),
+        c.created ? el('span', { className: 'muted num', style: { marginLeft: '10px', fontSize: '12.5px' } }, `created ${fmtDate(c.created)}`) : null,
+        el('span', { className: 'muted', style: { marginLeft: '10px', fontSize: '12.5px' } }, `${n} session${n > 1 ? 's' : ''}`)))); }
+    const tr = el('tr', { className: 'case', tabIndex: 0 },
+      el('td', {}, pill(c.kind), el('div', { className: 'verdict', textContent: c.verdict }),
+        c.sessionKind && c.sessionKind !== c.kind ? el('div', { className: 'muted', style: { fontSize: '12px' }, title: c.sessionVerdict }, `Whole session: ${(KINDS[c.sessionKind] || KINDS.unknown).label}`) : null,
+        c.errors.length ? el('div', { className: 'errs', title: c.errors.join('\n'), textContent: c.errors.join(' · ') }) : null),
+      el('td', {}, stepsView(c.focus), el('div', { style: { marginTop: '6px' } }, mini(c.phases, c.kind))),
+      el('td', {}, el('div', { style: { fontWeight: 600 }, textContent: c.agencyCode || '—' }), el('div', { className: 'muted', style: { fontSize: '12.5px' }, textContent: c.agencyName })),
+      el('td', { className: 'ink2', textContent: c.suppliers.join(', ') || '—' }),
+      el('td', { className: 'num' }, el('div', {}, fmtDate(c.last)), el('div', { className: 'muted', style: { fontSize: '12px' } }, `took ${dur(c.first, c.last)}`)),
+      el('td', { className: 'num muted', style: { textAlign: 'right' }, textContent: c.events }));
+    tr.onclick = () => openCase(c); tr.onkeydown = (e) => { if (e.key === 'Enter') openCase(c); };
+    tr.dataset.cid = c.correlationId; tb.append(tr);
+  }
+  $('#casesWrap').replaceChildren(el('table', { className: 'tbl' },
+    el('thead', {}, el('tr', {}, ['Verdict', 'Pay & book', 'Agency', 'Supplier', 'Last activity', 'Events'].map((h, i) => el('th', { textContent: h, style: i === 5 ? { textAlign: 'right' } : {} })))), tb));
+}
+
+/* pay & book focus: bookAndPay → processMakePayment → payment gateway → supplier book */
+const STEP = { ok: ['✓', 'var(--good)', 'done'], error: ['✕', 'var(--critical)', 'error'], pending: ['‖', 'var(--warning)', 'no result'], missing: ['○', 'var(--neutral)', 'not reached'], none: ['–', 'var(--neutral)', 'n/a'] };
+function stepsView(f) {
+  if (!f) return el('span', { className: 'muted' }, '—');
+  if (f.error) return el('span', { className: 'err' }, '⚠ ' + f.error);
+  return el('div', { className: 'steps' }, f.steps.map(s => { const [ic, c, lab] = STEP[s.state] || STEP.none;
+    return el('div', { className: 'stp s-' + s.state, title: `${s.step}: ${lab}` },
+      el('span', { className: 'ico' + (s.state === 'pending' ? ' dark-ink' : ''), style: { background: c }, textContent: ic }),
+      el('b', {}, s.step), s.time ? el('span', { className: 'muted num' }, fmtTime(s.time).slice(0, 8)) : null,
+      el('span', { className: 'ink2 sd' }, s.detail)); }),
+    f.exception ? el('div', { className: 'stp s-error' }, el('span', { className: 'ico', style: { background: 'var(--critical)' }, textContent: '✕' }), el('b', {}, 'Exception'), el('span', { className: 'ink2 sd' }, f.exception)) : null);
+}
+
+/* PDF export (rendered locally by the server with headless Edge) */
+function casesReport() {
+  const shown = result.rows.filter(r => !hidden.has(r.kind));
+  const q = result.query || {};
+  return { title: 'NDC – Not Booked Investigation', tz: Intl.DateTimeFormat().resolvedOptions().timeZone, searched: result.searched,
+    query: [q.agency ? `agency ${q.agency}` : '', (q.items || []).length ? `${q.items.length} ref(s), ${q.items.filter(x => x.created).length} with creation time, window −${q.before}/+${q.after} min` : '',
+      hidden.size ? `hidden: ${[...hidden].join(', ')}` : ''].filter(Boolean).join(' · '),
+    rows: shown.map(r => ({ ref: r.ref, created: r.created, kind: r.kind, verdict: r.verdict, focus: r.focus, agencyCode: r.agencyCode, agencyName: r.agencyName,
+      suppliers: r.suppliers, last: r.last, correlationId: r.correlationId })),
+    notFound: result.notFound, otherAgency: result.otherAgency };
+}
+$('#azdo').onclick = () => {
+  if (!result) return;
+  const rep = casesReport();
+  const lines = rep.rows.map(r => `- ${r.ref || '(no ref)'}: ${(KINDS[r.kind] || KINDS.unknown).label} – ${r.verdict}${r.agencyCode ? ' (' + r.agencyCode + ')' : ''}`);
+  sendToTeamLeader({ report: rep, comment: `Not-booked investigation: ${rep.searched} ref(s), ${rep.rows.length} session(s).\n\n${lines.slice(0, 30).join('\n')}${lines.length > 30 ? `\n… and ${lines.length - 30} more` : ''}${rep.notFound.length ? `\n\nNot found in logs: ${rep.notFound.map(n => n.ref).join(', ')}` : ''}\n\nDetails in the attached PDF.` });
+};
+$('#pdf').onclick = async () => {
+  if (!result) return;
+  const btn = $('#pdf'); btn.disabled = true; const old = btn.textContent; btn.textContent = 'Building PDF…';
+  try {
+    const payload = casesReport();
+    const res = await fetch('/api/export/pdf', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.status);
+    const a = el('a', { href: URL.createObjectURL(await res.blob()), download: `not-booked-cases-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '')}.pdf` });
+    a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 10000); toast('PDF downloaded');
+  } catch (e) { toast('⚠ PDF export failed: ' + e.message); }
+  finally { btn.disabled = false; btn.textContent = old; }
+};
+
+/* drawer */
+const openD = () => { $('#drawer').classList.add('open'); $('#scrim').classList.add('open'); };
+function closeDrawer() { $('#drawer').classList.remove('open'); $('#scrim').classList.remove('open'); document.querySelectorAll('tr.case.sel').forEach(x => x.classList.remove('sel')); }
+$('#scrim').onclick = closeDrawer;
+let tl = null; let curCase = null; const tlOpts = { payBook: true, hideSearch: true, errorsOnly: false };
+
+
+async function openCase(c) {
+  document.querySelectorAll('tr.case.sel').forEach(x => x.classList.remove('sel'));
+  document.querySelector(`tr.case[data-cid="${CSS.escape(c.correlationId)}"]`)?.classList.add('sel');
+  $('#dh').replaceChildren(
+    el('div', { className: 'dh-top' }, el('h3', { className: 'mono', textContent: c.ref || c.refs[0] || 'Session' }), pill(c.kind), el('div', { style: { flex: 1 } }),
+      el('a', { className: 'iconbtn', href: '/exceptions?cid=' + encodeURIComponent(c.correlationId), style: { textDecoration: 'none' } }, '⚡ Explain exceptions'),
+      el('a', { className: 'iconbtn', href: osdLink(c.correlationId), target: '_blank', rel: 'noopener', style: { textDecoration: 'none' } }, 'Open in OpenSearch ↗'),
+      el('button', { className: 'iconbtn', type: 'button', onclick: closeDrawer, title: 'Close (Esc)' }, '✕')),
+    el('div', { className: 'ink2', textContent: c.verdict }),
+    el('div', { className: 'meta' },
+      el('span', {}, 'Agency ', el('b', {}, c.agencyCode || '—'), c.agencyName ? ` · ${c.agencyName}` : ''),
+      el('span', {}, 'Supplier ', el('b', {}, c.suppliers.join(', ') || '—')),
+      el('span', {}, 'From ', el('b', { className: 'num' }, fmtDate(c.first)), ' to ', el('b', { className: 'num' }, fmtDate(c.last)), ` (${dur(c.first, c.last)})`),
+      el('span', {}, 'Session ', el('span', { className: 'mono' }, c.correlationId.slice(0, 14) + '…'), copyBtn(c.correlationId)),
+      c.refs.length ? el('span', {}, 'Refs logged ', el('span', { className: 'mono' }, c.refs.join(', '))) : null),
+    c.agencies && c.agencies.length > 1 ? el('div', { className: 'notice', style: { fontSize: '12.5px' } },
+      el('span', { className: 'pill', style: { '--c': 'var(--warning)' } }, el('span', { className: 'ico dark-ink', textContent: '!' }), 'Mixed session'),
+      el('span', {}, `This session id also carries activity from other agencies (${c.agencies.filter(a => a !== c.agencyCode).join(', ')}). The booking agency is ${c.agencyCode || 'unknown'} – check agencyCode on each event.`)) : null,
+    journey(c.phases, c.kind),
+    c.focus && c.focus.steps ? el('div', { className: 'focusbox' }, el('div', { className: 'muted', style: { fontSize: '12px', marginBottom: '4px' } },
+      `Pay & book around this ref (${fmtDate(c.focus.from)} – ${fmtDate(c.focus.to)})`), stepsView(c.focus)) : null);
+  curCase = c;
+  $('#db').replaceChildren(el('div', { className: 'empty' }, 'Loading timeline…'));
+  openD();
+  try { tl = await api('/api/timeline?cid=' + encodeURIComponent(c.correlationId)); renderTimeline(); }
+  catch (e) { $('#db').replaceChildren(el('div', { className: 'err' }, '⚠ ' + e.message)); }
+}
+
+const SKIP = new Set(['externalService', 'actionName', 'statusCode']);
+function renderTimeline() {
+  const isSearch = (e) => /^search$/i.test((e.context || {}).actionName || '');
+  const isErr = (e) => { const c = e.context || {}; return e.level === 'ERROR' || c.errorMessage || c.exception || (c.statusCode != null && c.statusCode != 200 && !isSearch(e)); };
+  let hiddenN = 0;
+  // Pay & book only: bookAndPay / processMakePayment / payment gateway / supplier Hold-Book + errors, inside the ref's focus window.
+  const fw = curCase && curCase.focus && curCase.focus.from ? [curCase.focus.from, curCase.focus.to] : null;
+  const isPayBook = (e) => ['payment', 'book'].includes(phaseOf(e)) || isErr(e);
+  const evs = tl.events.filter(e => {
+    if (tlOpts.payBook && (!isPayBook(e) || (fw && (e.time < fw[0] || e.time > fw[1])))) return false;
+    if (tlOpts.hideSearch && isSearch(e)) { hiddenN++; return false; } if (tlOpts.errorsOnly && !isErr(e)) return false; return true; });
+  const tools = el('div', { className: 'tools' },
+    el('span', { className: 'muted' }, `${evs.length} of ${tl.total} events`),
+    ...[['payBook', 'Pay & book only'], ['hideSearch', `Hide supplier search calls${hiddenN ? ` (${hiddenN})` : ''}`], ['errorsOnly', 'Errors only']].map(([k, l]) => {
+      const i = el('input', { type: 'checkbox', checked: tlOpts[k] }); i.onchange = () => { tlOpts[k] = i.checked; renderTimeline(); };
+      return el('label', { className: 'switch' }, i, l); }));
+  const groups = []; for (const e of evs) { const p = phaseOf(e); const g = groups[groups.length - 1]; if (g && g.p === p) g.e.push(e); else groups.push({ p, e: [e] }); }
+  const blocks = groups.map(g => {
+    const errs = g.e.filter(isErr).length;
+    return el('div', { className: 'phase' },
+      el('div', { className: 'phase-h' }, el('b', {}, PHN[g.p]), el('span', { className: 'muted num' }, `${fmtTime(g.e[0].time)} – ${fmtTime(g.e[g.e.length - 1].time)}`),
+        el('span', { className: 'muted' }, `${g.e.length} event${g.e.length > 1 ? 's' : ''}`), errs ? el('span', { className: 'pill', style: { '--c': 'var(--critical)' } }, el('span', { className: 'ico', textContent: '✕' }), `${errs} error${errs > 1 ? 's' : ''}`) : null),
+      ...g.e.map(evRow));
+  });
+  $('#db').replaceChildren(tools, ...(blocks.length ? blocks : [el('div', { className: 'empty' }, 'No events match the filters.')]));
+  function evRow(e) {
+    const c = e.context || {}; const code = c.statusCode;
+    const extra = Object.entries(c).filter(([k, v]) => !SKIP.has(k) && v !== '' && v != null);
+    const body = el('div', {},
+      el('div', { className: 'ttl' }, e.message || '', ' ', el('span', { className: 'mono', textContent: e.method || '' })),
+      c.externalService || c.actionName ? el('div', { className: 'sub' }, [c.externalService, c.actionName].filter(Boolean).join(' · ')) : null,
+      extra.length ? el('dl', { className: 'kv' }, extra.flatMap(([k, v]) => [el('dt', { textContent: k }), el('dd', { textContent: typeof v === 'object' ? JSON.stringify(v) : String(v) })])) : null);
+    const more = el('button', { type: 'button', className: 'linkbtn', textContent: 'Show request / response' });
+    more.onclick = async () => { more.textContent = 'Loading…';
+      try { const d = await api(`/api/doc?id=${encodeURIComponent(e.id)}&index=${encodeURIComponent(e.index)}`); more.remove();
+        const parts = ['request', 'response', 'returnValue', 'stacktrace', 'body'].filter(k => d[k]).map(k => { const txt = typeof d[k] === 'string' ? pretty(d[k]) : JSON.stringify(d[k], null, 2);
+          return el('div', {}, el('div', { className: 'ph' }, k, copyBtn(txt, 'copy')), el('pre', { textContent: txt })); });
+        body.append(el('div', { className: 'payload' }, parts.length ? parts : el('span', { className: 'muted' }, 'No payload logged for this event.'))); }
+      catch (err) { more.textContent = '⚠ ' + err.message; } };
+    body.append(el('div', { style: { marginTop: '4px' } }, more));
+    return el('div', { className: 'ev' + (isErr(e) ? ' isErr' : '') },
+      el('div', { className: 't mono num', textContent: fmtTime(e.time) }),
+      el('div', { className: 'lvl ' + (e.level || ''), title: e.level || '' }), body,
+      code != null ? el('span', { className: 'http ' + (code == 200 ? 'ok' : 'bad'), textContent: `HTTP ${code}` }) : el('span'));
+  }
+}
+/* deep link: ?refs=a,b&agency=X&from=ISO&to=ISO (&theme=dark, &open=N opens row N) */
+(() => { const p = new URLSearchParams(location.search);
+  if (p.get('theme')) setTheme(p.get('theme'));
+  if (!p.get('refs') && !p.get('agency')) return;
+  $('[name=refs]').value = (p.get('refs') || '').split(',').join('\n'); $('[name=refs]').dispatchEvent(new Event('input'));
+  $('[name=agency]').value = p.get('agency') || '';
+  if (p.get('from')) { $('[name=autoRange]').checked = false; $('[name=from]').value = toLocal(new Date(p.get('from'))); $('[name=to]').value = toLocal(new Date(p.get('to') || Date.now())); syncDates(); }
+  const open = p.get('open');
+  $('#f').requestSubmit();
+  if (open) { const iv = setInterval(() => { if (result) { clearInterval(iv); if (result.rows[+open]) openCase(result.rows[+open]); } }, 200); }
+})();
+
+/* CSV */
+$('#csv').onclick = () => {
+  if (!result) return;
+  const q = (v) => '"' + String(v ?? '').replace(/"/g, '""') + '"';
+  const head = ['booking_ref', 'created_local', 'verdict_kind', 'verdict', 'bookAndPay', 'processMakePayment', 'payment', 'supplier_book', 'exception', 'stopped_at', 'agency_code', 'agency_name', 'suppliers', 'first_activity_utc', 'last_activity_utc', 'last_step', 'errors', 'refs_logged', 'events', 'correlation_id'];
+  const stepTxt = (c, name) => { const s = c.focus && c.focus.steps ? c.focus.steps.find(x => x.step === name) : null; return s ? `${s.state}${s.time ? ' ' + fmtTime(s.time).slice(0, 8) : ''}: ${s.detail}` : ''; };
+  const lines = [head.join(',')];
+  for (const c of result.rows) { const s = stopIndex(c.phases, c.kind);
+    lines.push([c.ref, c.created ? fmtDate(c.created) : '', c.kind, c.verdict, stepTxt(c, 'bookAndPay'), stepTxt(c, 'processMakePayment'), stepTxt(c, 'Payment'), stepTxt(c, 'Supplier book'),
+      (c.focus && c.focus.exception) || '', s >= 0 ? PH[s][1] : '', c.agencyCode, c.agencyName, c.suppliers.join(' '), c.first, c.last, c.lastStep, c.errors.join(' | '), c.refs.join(' '), c.events, c.correlationId].map(q).join(',')); }
+  for (const n of result.notFound) lines.push([n.ref, 'not-found', `No logs ${n.window.from} – ${n.window.to}`].map(q).join(','));
+  for (const o of result.otherAgency) lines.push([o.ref, 'other-agency', 'Belongs to ' + o.agencies.join('/')].map(q).join(','));
+  const a = el('a', { href: URL.createObjectURL(new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv' })), download: `not-booked-cases-${new Date().toISOString().slice(0, 16).replace(/:/g, '')}.csv` });
+  a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+};
+</script>
+</body>
+</html>

@@ -1,0 +1,564 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NDC · Exceptions</title>
+<script>document.documentElement.dataset.theme = localStorage.getItem('nb-theme') || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');</script>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header class="bar">
+  <div class="brand"><div class="logo">NB</div>NDC · Not Booked Investigation</div>
+  <nav class="tabs"><a href="/">Cases</a><a href="/failures">Booking failures</a><a href="/exceptions" aria-current="page">Exceptions</a></nav>
+  <div class="sp"></div>
+  <span class="muted" style="font-size:12.5px">ndc-core-backend-log · read-only</span>
+  <button class="iconbtn" id="themeBtn" title="Toggle light / dark"></button>
+</header>
+
+<main>
+  <section class="card">
+    <div class="card-h" style="gap:14px">
+      <div class="seg" id="modeSeg" role="tablist">
+        <button type="button" data-mode="session" aria-pressed="true">By session</button>
+        <button type="button" data-mode="history" aria-pressed="false">Exception history</button>
+        <button type="button" data-mode="changes" aria-pressed="false">What changed</button>
+      </div>
+      <span class="muted" id="modeHint" style="font-size:12.5px">Explain every error in one session (correlation id).</span>
+    </div>
+    <form id="hf" class="card-b" autocomplete="off" hidden style="display:flex;gap:12px;align-items:end;flex-wrap:wrap">
+      <label class="field" style="flex:1;min-width:240px">
+        <span>Exception name</span>
+        <input type="text" name="exception" list="exList" placeholder="NullPointerException" class="mono">
+      </label>
+      <label class="field" style="flex:1;min-width:220px">
+        <span>Method</span>
+        <input type="text" name="method" list="mList" placeholder="getSearchResult" class="mono">
+      </label>
+      <div class="field">
+        <span>Range</span>
+        <div class="seg" id="hRange">
+          <button type="button" data-d="1">24h</button><button type="button" data-d="3">3d</button>
+          <button type="button" data-d="7" aria-pressed="true">7d</button><button type="button" data-d="30">30d</button>
+        </div>
+      </div>
+      <button class="primary" id="hgo"><span id="hgoTxt">Show history</span></button>
+      <datalist id="exList"></datalist><datalist id="mList"></datalist>
+    </form>
+    <form id="cf" class="card-b" autocomplete="off" hidden style="display:grid;gap:10px">
+      <div style="display:flex;gap:12px;align-items:end;flex-wrap:wrap">
+        <label class="field"><span>Changed since (deploy / merge time)</span><input type="datetime-local" name="at"></label>
+        <button class="primary" id="cgo"><span id="cgoTxt">Compare</span></button>
+        <span class="hint">Errors after this time vs the same hours on the 3 previous days (average).</span>
+      </div>
+      <div class="chips" id="merges"><span class="muted" style="font-size:12.5px">Recent merges: loading…</span></div>
+    </form>
+    <form id="f" class="card-b" autocomplete="off" style="display:flex;gap:12px;align-items:end;flex-wrap:wrap">
+      <label class="field" style="flex:1;min-width:360px">
+        <span>Correlation id (session)</span>
+        <input type="text" name="cid" class="mono" placeholder="e.g. 9uDCR_OPJeu1tai2IfrvqaJw5pumERsSoWqlMNy1" style="font-family:ui-monospace,Consolas,monospace">
+      </label>
+      <button class="primary" id="go"><span id="goTxt">Explain exceptions</span></button>
+    </form>
+    <div class="card-b hint" id="sessHint" style="padding-top:0">
+      Lists every error in the session, explains the likely reason and how to resolve it, and shows the failing line of code
+      (from your local odeysys checkout, <span class="mono" id="gitRef">origin/master</span>). Explanations are rule-based; nothing is sent outside your machine.
+    </div>
+    <div id="err" class="err card-b" style="padding-top:0" hidden></div>
+  </section>
+
+  <div id="out" style="display:grid;gap:16px">
+    <section class="card"><div class="empty"><div class="big">Paste a correlation id</div>
+      Or open a case on the Cases page and click <b>⚡ Explain exceptions</b>.</div></section>
+  </div>
+</main>
+<div class="tip" id="tip"></div>
+<div class="toast" id="toast"></div>
+
+<script src="/common.js"></script>
+<script>
+const IMPACT = {
+  blocking: { c: 'var(--critical)', i: '✕', label: 'Blocks booking' },
+  related:  { c: 'var(--warning)',  i: '!', label: 'May affect booking', dark: true },
+  noise:    { c: 'var(--neutral)',  i: '–', label: 'Not booking-related' },
+};
+const PHASE_NAME = Object.fromEntries([...PH, ['other', 'Other']]);
+
+$('#f').addEventListener('submit', (e) => { e.preventDefault(); const cid = $('[name=cid]').value.trim(); if (cid) load(cid); });
+
+async function load(cid) {
+  history.replaceState(null, '', '?cid=' + encodeURIComponent(cid));
+  const go = $('#go'); go.disabled = true; go.prepend(el('span', { className: 'spinner' })); $('#goTxt').textContent = 'Analysing…'; $('#err').hidden = true;
+  try { render(cid, await api('/api/exceptions?cid=' + encodeURIComponent(cid))); }
+  catch (e) { $('#err').hidden = false; $('#err').textContent = '⚠ ' + e.message; }
+  finally { go.disabled = false; $('.spinner', go)?.remove(); $('#goTxt').textContent = 'Explain exceptions'; }
+}
+
+function render(cid, d) {
+  $('#gitRef').textContent = d.gitRef;
+  const s = d.session; const ex = d.exceptions;
+  const out = [];
+  /* session header */
+  if (s) out.push(el('section', { className: 'card' },
+    el('div', { className: 'card-h' }, el('h2', {}, 'Session'), pill(s.kind), el('div', { style: { flex: 1 } }),
+      el('a', { className: 'iconbtn', href: '/?refs=' + encodeURIComponent((s.refs || []).join(',')) + (s.refs && s.refs.length ? '' : '&agency=' + encodeURIComponent(s.agencyCode)), style: { textDecoration: 'none' }, hidden: !(s.refs && s.refs.length) }, 'Open case'),
+      el('a', { className: 'iconbtn', href: osdLink(cid), target: '_blank', rel: 'noopener', style: { textDecoration: 'none' } }, 'Open in OpenSearch ↗')),
+    el('div', { className: 'card-b', style: { display: 'grid', gap: '12px' } },
+      el('div', { className: 'meta' },
+        el('span', {}, 'Agency ', el('b', {}, s.agencyCode || '—'), s.agencyName ? ` · ${s.agencyName}` : ''),
+        el('span', {}, 'Supplier ', el('b', {}, s.suppliers.join(', ') || '—')),
+        el('span', {}, 'Refs ', el('b', { className: 'mono' }, s.refs.join(', ') || '—')),
+        el('span', {}, el('b', { className: 'num' }, fmtDate(s.first)), ' → ', el('b', { className: 'num' }, fmtDate(s.last)), ` (${dur(s.first, s.last)})`),
+        el('span', {}, 'Session ', el('span', { className: 'mono' }, cid), copyBtn(cid))),
+      journey(s.phases, s.kind))));
+
+  /* conclusion */
+  if (!ex.length) out.push(el('section', { className: 'card' }, el('div', { className: 'empty' }, el('div', { className: 'big' }, 'No errors logged in this session'),
+    s ? `Verdict from the case analysis: ${s.verdict}` : 'Check the correlation id (logs are kept ~30 days).')));
+  else {
+    const main = ex[0]; const I = IMPACT[main.impact];
+    const counts = { blocking: 0, related: 0, noise: 0 }; ex.forEach(e => counts[e.impact]++);
+    out.push(el('section', { className: 'card card-b' },
+      el('div', { className: 'verdict-box', style: { '--c': I.c } },
+        el('span', { className: 'ico' + (I.dark ? ' dark-ink' : ''), textContent: I.i }),
+        el('div', {},
+          el('div', { className: 'muted', style: { fontSize: '12px', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '.05em' } }, 'Most likely reason'),
+          el('h3', {}, main.title),
+          el('div', { className: 'ink2' }, typeof main.cause === 'string' ? main.cause : ''),
+          main.agent[0] ? el('div', { style: { marginTop: '8px' } }, el('b', {}, 'First action: '), main.agent[0]) : null,
+          el('div', { className: 'muted', style: { marginTop: '8px', fontSize: '12.5px' } },
+            `${d.totalErrors} error event(s) in ${ex.length} distinct exception(s): ${counts.blocking} blocking · ${counts.related} may affect · ${counts.noise} noise`)))));
+    ex.forEach((e, i) => out.push(card(e, i)));
+  }
+  $('#out').replaceChildren(...out);
+}
+
+function card(e, i) {
+  const I = IMPACT[e.impact];
+  const raw = [e.exception, e.errorMessage, e.message].filter((v, k, a) => v && a.indexOf(v) === k);
+  const fixes = [...e.agent.map(t => ['ops', t]), ...e.dev.map(t => ['dev', t])];
+  const codeBox = el('div');
+  const fixCtx = { type: e.type, msg: e.msg, method: e.method, frames: e.frames.filter(f => f.app), what: e.what, cause: e.cause, before: e.before, count: e.count };
+  const showCode = (code, frame) => codeBox.replaceChildren(codeView(code, frame, e.host, fixCtx));
+  if (e.code) showCode(e.code, e.top);
+  const frames = el('div', { className: 'frames' }, e.frames.slice(0, 40).map((f) => {
+    const isTop = e.top && f.className === e.top.className && f.lineNumber === e.top.lineNumber && f.methodName === e.top.methodName;
+    const r = el('div', { className: `fr ${f.app ? 'app' : 'lib'}${isTop ? ' top' : ''}`, title: f.app ? 'Show this code' : '' },
+      el('span', {}, f.app ? '●' : '·'), `${f.simpleClass}.${f.methodName}`, el('span', { className: 'muted' }, `(${f.fileName || '?'}:${f.lineNumber})`));
+    if (f.app) r.onclick = async () => { codeBox.replaceChildren(el('div', { className: 'muted' }, 'Loading…'));
+      try { showCode(await api(`/api/code?cls=${encodeURIComponent(f.className)}&file=${encodeURIComponent(f.fileName)}&line=${f.lineNumber}&host=${encodeURIComponent(e.host || '')}`), f); }
+      catch (err) { codeBox.replaceChildren(el('div', { className: 'err' }, err.message)); } };
+    return r; }));
+  const fr = el('details', {}, el('summary', { className: 'linkbtn', style: { cursor: 'pointer' } }, `Stack trace (${e.frames.length} frames · click a ● frame to see its code)`), frames);
+
+  return el('section', { className: 'card exc' },
+    el('div', { className: 'exc-h' },
+      el('span', { className: 'muted num', style: { fontWeight: 700 } }, `#${i + 1}`),
+      el('span', { className: 'ico' + (I.dark ? ' dark-ink' : ''), style: { background: I.c }, textContent: I.i }),
+      el('h3', {}, e.title),
+      el('span', { className: 'impact ' + e.impact }, I.label),
+      el('span', { className: 'conf', title: e.known ? 'Matched a known, specific pattern' : 'Explained from the exception type and code location only' }, e.known ? 'known pattern' : 'inferred'),
+      el('a', { className: 'linkbtn', style: { textDecoration: 'none', fontSize: '12.5px' }, title: 'History of this exception across all sessions',
+        href: '/exceptions?' + new URLSearchParams({ mode: 'history', exception: e.type || '', method: e.method || '', days: 7 }) }, 'History →'),
+      el('div', { style: { flex: 1 } }),
+      el('span', { className: 'muted num', style: { fontSize: '12.5px' } }, `${e.count > 1 ? `${e.count}× · ` : ''}${fmtDate(e.first)}:${pad(new Date(e.first).getSeconds())}${e.count > 1 ? ' – ' + fmtTime(e.last) : ''} · ${PHASE_NAME[e.phase] || e.phase}${e.host ? ' · ' + e.host : ''}`)),
+    statusStrip(e),
+    el('div', { className: 'exc-b' },
+      el('div', {},
+        el('div', { className: 'sec' }, 'What happened'), el('div', {}, e.what),
+        el('div', { className: 'sec' }, 'Why (likely cause)'), el('div', {}, e.cause),
+        fixes.length ? el('div', { className: 'sec' }, 'How to resolve') : null,
+        fixes.length ? el('ul', { className: 'fix' }, fixes.map(([w, t]) => el('li', {}, el('span', { className: 'who ' + w, textContent: w === 'ops' ? 'Support' : 'Dev' }), el('span', {}, t)))) : null,
+        el('div', { className: 'sec' }, 'Logged error'), el('div', { className: 'raw' }, raw.join('\n') || '—'),
+        e.before.length ? el('div', { className: 'sec' }, 'Just before') : null,
+        e.before.length ? el('div', { className: 'ctx' }, e.before.map(b => el('div', {},
+          el('span', { className: 'mono muted' }, fmtTime(b.time)),
+          el('span', {}, el('span', { className: 'mono' }, b.method || ''), ' ', el('span', { className: 'muted' }, [b.message, b.supplier, b.action].filter(Boolean).join(' · '))),
+          b.statusCode != null ? el('span', { className: 'http ' + (b.statusCode == 200 ? 'ok' : 'bad'), textContent: b.statusCode }) : el('span')))) : null),
+      el('div', {},
+        el('div', { className: 'sec' }, 'Where in the code'),
+        e.top ? codeBox : el('div', { className: 'muted' }, 'No stack trace was logged for this error.'),
+        e.frames.length ? el('div', { style: { marginTop: '10px' } }, fr) : null)));
+}
+
+// Production status of this error (all sessions) + commits to the failing file in GIT_REF since it happened.
+function statusStrip(e) {
+  const p = e.prod; if (!p && !(e.fixes || []).length) return null;
+  const items = [];
+  if (p && p.lastSeen) {
+    const ago = (Date.now() - new Date(p.lastSeen)) / 3600e3;
+    if (p.last24h > 0) items.push(el('div', { className: 'st-row' },
+      el('span', { className: 'pill', style: { '--c': 'var(--critical)' } }, el('span', { className: 'ico', textContent: '●' }), 'Still happening'),
+      el('span', {}, `${p.last24h.toLocaleString()} in the last 24h · ${p.last7d.toLocaleString()} in 7 days · last seen ${fmtDate(p.lastSeen)}`)));
+    else items.push(el('div', { className: 'st-row' },
+      el('span', { className: 'pill', style: { '--c': 'var(--good)' } }, el('span', { className: 'ico', textContent: '✓' }), 'Not seen recently'),
+      el('span', {}, `Last seen in production ${fmtDate(p.lastSeen)} (${ago < 48 ? Math.round(ago) + ' h' : Math.round(ago / 24) + ' days'} ago) · ${p.last7d.toLocaleString()} in the last 7 days. Likely fixed or no longer triggered.`)));
+  }
+  const fx = e.fixes || [];
+  const file = e.code && e.code.path ? `${e.code.path.split('/').pop()}:${e.code.line}` : '';
+  if (fx.length) items.push(el('div', { className: 'st-row' },
+    el('span', { className: 'pill', style: { '--c': 'var(--accent)' } }, el('span', { className: 'ico', textContent: '⎇' }), 'Line changed by'),
+    el('div', { style: { display: 'grid', gap: '2px' } }, fx.map(f => el('div', {},
+      el('span', { className: 'mono' }, f.hash), copyBtn(f.hash), ` ${f.date} · ${f.author} · `, el('b', {}, f.subject),
+      f.afterError ? el('span', { className: 'muted' }, '  (after this error)') : null)),
+      el('span', { className: 'muted', style: { fontSize: '12px' } }, `Latest commits in ${e.code.ref} that changed ${file} (last 120 days). A fix only helps once it is deployed – check "Not seen recently" above.`))));
+  else if (file) items.push(el('div', { className: 'st-row muted' }, el('span'), `${file} has not changed in ${e.code.ref} in the last 120 days.`));
+  return el('div', { className: 'status-strip' }, items);
+}
+
+function ideButton(repoPath, line) {
+  const b = el('button', { type: 'button', className: 'iconbtn', style: { height: '26px', fontSize: '12px', fontWeight: 600 },
+    title: 'Open this line in IntelliJ IDEA (your working copy)' }, el('span', { className: 'ij', textContent: 'IJ' }), 'Open in IntelliJ');
+  b.onclick = async () => {
+    b.disabled = true;
+    try {
+      const r = await api('/api/open-ide', { path: repoPath, line });
+      toast(`Opened in IntelliJ at line ${r.line}` + (r.shifted ? ` (${r.shifted > 0 ? '+' : ''}${r.shifted} lines on your branch)` : '')
+        + (r.notFound ? ' – this line differs on your branch' : ''));
+    } catch (e) { toast('⚠ ' + e.message); }
+    finally { b.disabled = false; }
+  };
+  return b;
+}
+
+function codeView(code, frame, host, ctx) {
+  if (!code) return el('div', { className: 'muted' }, 'No code location.');
+  if (code.error) return el('div', { className: 'err' }, 'Could not read the code: ' + code.error);
+  if (code.missing) return el('div', { className: 'muted' }, `${frame.className} is not in ${code.ref} (class may be generated, renamed or from a library).`);
+  const fixBox = el('div');
+  const view = codeTable(code, frame, ctx ? fixButton(ctx, frame, fixBox) : null);
+  return ctx ? el('div', {}, view, fixBox) : view;
+}
+
+function codeTable(code, frame, fixBtn) {
+  const tb = el('tbody', {}, code.lines.map((l, k) => { const n = code.from + k;
+    return el('tr', { className: n === code.line ? 'hit' : '' }, el('td', { className: 'ln', textContent: n }), el('td', { textContent: l || ' ' })); }));
+  return el('div', { className: 'code' },
+    el('div', { className: 'code-h' },
+      el('span', { className: 'mono', style: { fontWeight: 600 } }, `${frame.simpleClass}.${frame.methodName}()`),
+      el('span', { className: 'muted mono' }, `${code.path}:${code.line}`), copyBtn(`${code.path}:${code.line}`),
+      el('div', { style: { flex: 1 } }),
+      fixBtn,
+      ideButton(code.path, code.line),
+      el('a', { href: `vscode://file/${code.localFile}:${code.line}`, title: 'Opens your working copy; lines may differ from ' + code.ref }, 'VS Code'),
+      el('span', { className: 'muted' }, '@ ' + code.ref)),
+    code.outOfRange ? el('div', { className: 'err', style: { padding: '6px 10px' } }, `Line ${code.line} is beyond the file in ${code.ref}: production runs a different version.`) : null,
+    (() => { const hit = (code.lines[code.line - code.from] || '').trim();
+      return !code.outOfRange && (!hit || /^(\/\/|\/\*|\*)/.test(hit) || /^[{}]$/.test(hit))
+        ? el('div', { className: 'err', style: { padding: '6px 10px', fontSize: '12.5px' } }, `⚠ Line ${code.line} is ${hit ? 'a comment / brace' : 'blank'} in ${code.ref}, so it cannot throw. Production runs a different version of this file than ${code.ref} – the snippet may not show the real failing code.`)
+        : null; })(),
+    el('div', { className: 'code-scroll' }, el('table', {}, tb)),
+    code.alsoIn && code.alsoIn.length ? el('div', { className: 'muted', style: { padding: '4px 10px', fontSize: '11.5px' } }, 'Same class also in: ' + code.alsoIn.join(', ')) : null);
+}
+
+/* ================= Suggested fix (local rules, no AI) ================= */
+function fixButton(ctx, frame, box) {
+  const b = el('button', { type: 'button', className: 'iconbtn fixbtn', title: 'Suggest a code fix for this line (generated locally, nothing is sent anywhere)' }, '💡 Suggest fix');
+  b.onclick = async () => {
+    if (box.firstChild) { box.replaceChildren(); return; }
+    box.replaceChildren(el('div', { className: 'fixpanel muted' }, 'Analysing the code…'));
+    try {
+      const frames = (ctx.frames && ctx.frames.length ? ctx.frames : [frame]);
+      const p = await api('/api/fix/propose', { type: ctx.type, msg: ctx.msg, method: ctx.method, top: frame, frames });
+      box.replaceChildren(fixPanel(p, box));
+    } catch (e) { box.replaceChildren(el('div', { className: 'fixpanel err' }, '⚠ ' + e.message)); }
+  };
+  return b;
+}
+
+const CONF = { high: ['var(--good)', '✓', 'High confidence'], medium: ['var(--warning)', '!', 'Medium – review'], low: ['var(--serious)', '!', 'Low – review carefully'], none: ['var(--neutral)', '–', 'No suggestion'] };
+
+function fixPanel(p, box) {
+  const usable = p.suggestions.filter(s => s.valid);
+  const parts = [el('div', { className: 'fix-h' },
+    el('b', {}, usable.length ? `${usable.length} suggested fix${usable.length > 1 ? 'es' : ''}` : 'No automatic fix'),
+    el('span', { className: 'muted', style: { fontSize: '12px' } }, `rule-based, from the code at ${p.gitRef} · pick one, review the diff, apply`),
+    el('div', { style: { flex: 1 } }),
+    el('button', { type: 'button', className: 'iconbtn', onclick: () => box.replaceChildren() }, 'Close'))];
+  if (!p.suggestions.length) parts.push(el('div', { className: 'muted' }, 'No rule matches this exception type / line yet. Use the explanation above and fix it by hand.'));
+  const branch = el('input', { type: 'text', value: p.suggestedBranch, className: 'mono', style: { maxWidth: '420px' } });
+  p.suggestions.forEach((s, i) => parts.push(suggestionCard(s, i, branch)));
+  if (usable.length) parts.push(el('div', { className: 'fix-apply' },
+    el('label', { className: 'field', style: { flex: 1 } }, el('span', {}, `Fix branch in ${(cfg.fix || {}).worktree} (created from ${(cfg.fix || {}).gitRef} if new)`), branch)),
+    el('div', { className: 'muted', style: { fontSize: '12px' } }, 'Apply writes only into that separate worktree and opens the file in IntelliJ. Your current branch is not touched. Nothing is committed or pushed.'));
+  return el('div', { className: 'fixpanel' }, parts);
+}
+
+function suggestionCard(s, i, branchInput) {
+  const [c, icon, label] = CONF[s.confidence] || CONF.none;
+  const res = el('div');
+  const btn = s.valid ? el('button', { type: 'button', className: 'primary', style: { height: '32px' } }, el('span', { className: 'ij', textContent: 'IJ' }), ' Apply & open in IntelliJ') : null;
+  if (btn) btn.onclick = async () => {
+    btn.disabled = true; res.replaceChildren(el('div', { className: 'muted' }, 'Applying…'));
+    try {
+      const r = await api('/api/fix/apply', { id: s.id, branch: branchInput.value.trim() });
+      res.replaceChildren(el('div', { className: 'fix-ok' },
+        el('div', {}, el('b', {}, '✓ Applied'), ` in ${r.worktree} on branch `, el('span', { className: 'mono' }, r.branch), r.createdWorktree ? ` (new worktree from ${(cfg.fix || {}).gitRef})` : ''),
+        el('div', { className: 'muted' }, r.opened && !r.opened.error ? `Opened in IntelliJ at line ${r.results[0].line}.` : `Could not open IntelliJ: ${(r.opened || {}).error || 'n/a'}`),
+        el('div', { className: 'muted' }, r.next),
+        el('details', {}, el('summary', { className: 'linkbtn' }, 'git diff'), el('pre', { textContent: r.diff || '(no diff)' }))));
+      toast('Fix applied on ' + r.branch);
+    } catch (e) {
+      res.replaceChildren(el('div', { className: 'err' }, '⚠ ' + e.message));
+      const m = /uncommitted changes on (\S+)\./.exec(e.message); if (m) branchInput.value = m[1];
+      btn.disabled = false;
+    }
+  };
+  return el('div', { className: 'sugg' },
+    el('div', { className: 'fix-h' },
+      el('span', { className: 'muted num', style: { fontWeight: 700 } }, `${i + 1}.`),
+      el('b', {}, s.title),
+      el('span', { className: 'pill', style: { '--c': c } }, el('span', { className: 'ico' + (s.confidence === 'medium' ? ' dark-ink' : ''), textContent: icon }), label),
+      el('div', { style: { flex: 1 } }), btn),
+    el('div', { className: 'ink2', style: { fontSize: '13px' } }, s.why),
+    ...s.edits.map(diffView), res);
+}
+
+function diffView(ed) {
+  // Show find/replace as a diff: unchanged context lines are shown once, removed/added lines are marked.
+  const a = ed.find.split('\n'), b = ed.replace.split('\n');
+  let pre = 0; while (pre < a.length && pre < b.length && a[pre] === b[pre]) pre++;
+  let suf = 0; while (suf < a.length - pre && suf < b.length - pre && a[a.length - 1 - suf] === b[b.length - 1 - suf]) suf++;
+  const line = (cls, sign, t) => el('div', { className: 'dl ' + cls }, el('span', { className: 'sign' }, sign), t || ' ');
+  const rows = [...a.slice(0, pre).map(t => line('', ' ', t)), ...a.slice(pre, a.length - suf).map(t => line('del', '−', t)),
+    ...b.slice(pre, b.length - suf).map(t => line('add', '+', t)), ...a.slice(a.length - suf).map(t => line('', ' ', t))];
+  return el('div', { className: 'diff' },
+    el('div', { className: 'diff-h' }, el('span', { className: 'mono' }, `${ed.file}${ed.line ? ':' + ed.line : ''}`),
+      ed.valid ? null : el('span', { className: 'err' }, ` ⚠ ${ed.problem}`)),
+    el('div', { className: 'diff-b' }, rows));
+}
+
+/* ================= What changed (since a deploy) ================= */
+const toLocalInput = (d) => new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+let mergesLoaded = false;
+async function loadMerges() {
+  if (!$('[name=at]').value) $('[name=at]').value = toLocalInput(new Date(Date.now() - 6 * 3600e3));
+  if (mergesLoaded) return; mergesLoaded = true;
+  try {
+    const ms = await api('/api/merges');
+    $('#merges').replaceChildren(el('span', { className: 'muted', style: { fontSize: '12.5px' } }, 'Recent merges (git, not deploy time):'),
+      ...ms.slice(0, 10).map(m => { const c = el('button', { type: 'button', className: 'chip', title: m.subject }, `${m.branch} · ${fmtDate(m.time)} · ${m.subject.replace(/^Merge pull request /, '').slice(0, 34)}`);
+        c.onclick = () => { $('[name=at]').value = toLocalInput(new Date(m.time)); loadChanges(); }; return c; }));
+  } catch (e) { $('#merges').replaceChildren(el('span', { className: 'muted' }, 'Merges unavailable: ' + e.message)); }
+}
+$('#cf').addEventListener('submit', (e) => { e.preventDefault(); loadChanges(); });
+async function loadChanges() {
+  const at = new Date($('[name=at]').value).toISOString();
+  history.replaceState(null, '', '?' + new URLSearchParams({ mode: 'changes', at }));
+  const go = $('#cgo'); go.disabled = true; go.prepend(el('span', { className: 'spinner' })); $('#cgoTxt').textContent = 'Comparing…'; $('#err').hidden = true;
+  try { renderChanges(await api('/api/changes?at=' + encodeURIComponent(at))); }
+  catch (err) { $('#err').hidden = false; $('#err').textContent = '⚠ ' + err.message; }
+  finally { go.disabled = false; $('.spinner', go)?.remove(); $('#cgoTxt').textContent = 'Compare'; }
+}
+const CHG = { new: ['var(--critical)', '✚', 'New'], increased: ['var(--serious)', '▲', 'Increased'], gone: ['var(--good)', '✓', 'Gone'], decreased: ['var(--good)', '▼', 'Decreased'] };
+function renderChanges(d) {
+  const groups = ['new', 'increased', 'gone', 'decreased'].map(k => [k, d.rows.filter(r => r.change === k)]);
+  const head = el('section', { className: 'card' }, el('div', { className: 'card-h' }, el('h2', {}, `Since ${fmtDate(d.at)}`),
+      el('span', { className: 'muted', style: { fontSize: '12.5px' } }, `${d.hours} h until ${fmtDate(d.to)} · baseline: ${d.baseline}`)),
+    el('div', { className: 'card-b' }, el('div', { className: 'tiles' }, groups.map(([k, rows]) => { const [c, i, l] = CHG[k];
+      return el('div', { className: 'tile static', style: { '--c': c } }, el('div', { className: 'lab' }, el('span', { className: 'ico', style: { background: c }, textContent: i }), l), el('div', { className: 'val num', textContent: rows.length })); }))));
+  const table = (k, rows) => { const [c, i, l] = CHG[k];
+    return el('section', { className: 'card' }, el('div', { className: 'card-h' }, el('span', { className: 'ico', style: { background: c }, textContent: i }), el('h2', {}, `${l} (${rows.length})`),
+        el('span', { className: 'muted', style: { fontSize: '12.5px' } }, k === 'new' ? 'not seen in the baseline' : k === 'increased' ? 'at least 2× the baseline' : k === 'gone' ? 'in the baseline, none since' : 'less than 40% of the baseline')),
+      el('table', { className: 'tbl' }, el('thead', {}, el('tr', {}, ['Method', 'Exception', 'Baseline', 'Since', 'Code location', ''].map(h => el('th', { textContent: h })))),
+        el('tbody', {}, rows.map(r => el('tr', {},
+          el('td', { className: 'mono' }, r.method), el('td', { style: { maxWidth: '360px' } }, r.exception),
+          el('td', { className: 'num muted' }, String(r.before)), el('td', { className: 'num', style: { fontWeight: 700 } }, String(r.after)),
+          el('td', { className: 'mono', style: { fontSize: '12px' } }, r.location || '—', r.firstAfter ? el('div', { className: 'muted' }, 'first ' + fmtDate(r.firstAfter)) : null),
+          el('td', { style: { whiteSpace: 'nowrap' } },
+            el('a', { className: 'linkbtn', style: { textDecoration: 'none' }, href: '/exceptions?' + new URLSearchParams({ mode: 'history', exception: r.exception === '(no exception)' ? '' : r.exception.split(' : ')[0], method: r.method, days: 7 }) }, 'History →'), ' ',
+            r.sample ? el('a', { className: 'linkbtn', style: { textDecoration: 'none' }, href: '/exceptions?cid=' + encodeURIComponent(r.sample.cid) }, 'Example →') : null))))));
+  };
+  $('#out').replaceChildren(head, ...groups.filter(([, rows]) => rows.length).map(([k, rows]) => table(k, rows)));
+}
+
+/* ================= Exception history ================= */
+const MODE_HINT = { session: 'Explain every error in one session (correlation id).',
+  history: 'History of one exception (+ method) across all sessions: when it started, stopped, where in the code, on which servers.',
+  changes: 'Which errors are new, increased or gone since a time (e.g. a deploy), compared with the same hours on previous days.' };
+function setMode(m) {
+  document.querySelectorAll('#modeSeg button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.mode === m)));
+  $('#f').hidden = m !== 'session'; $('#sessHint').hidden = m !== 'session'; $('#hf').hidden = m !== 'history'; $('#cf').hidden = m !== 'changes';
+  $('#modeHint').textContent = MODE_HINT[m];
+  if (m === 'changes') loadMerges();
+}
+$('#modeSeg').onclick = (e) => { if (e.target.dataset.mode) { setMode(e.target.dataset.mode); $('#out').replaceChildren(emptyFor(e.target.dataset.mode)); } };
+const emptyFor = (m) => m === 'changes' ? el('section', { className: 'card' }, el('div', { className: 'empty' }, el('div', { className: 'big' }, 'Pick a time or a recent merge'), 'Shows exceptions that started, grew or stopped after it.')) : el('section', { className: 'card' }, el('div', { className: 'empty' },
+  el('div', { className: 'big' }, m === 'history' ? 'Enter an exception name and/or a method' : 'Paste a correlation id'),
+  m === 'history' ? 'e.g. NullPointerException + getSearchResult. Suggestions come from the last 7 days of errors.' : el('span', {}, 'Or open a case on the Cases page and click ', el('b', {}, '⚡ Explain exceptions'), '.')));
+let hDays = 7;
+$('#hRange').onclick = (e) => { if (!e.target.dataset.d) return; hDays = +e.target.dataset.d;
+  document.querySelectorAll('#hRange button').forEach(b => b.setAttribute('aria-pressed', String(b === e.target))); };
+api('/api/exception-suggest').then(s => {
+  $('#exList').replaceChildren(...s.exceptions.slice(0, 80).map(x => el('option', { value: x.key, label: `${x.n.toLocaleString()} in 7d` })));
+  $('#mList').replaceChildren(...s.methods.slice(0, 120).map(x => el('option', { value: x.key, label: `${x.n.toLocaleString()} errors in 7d` })));
+}).catch(() => {});
+$('#hf').addEventListener('submit', (e) => { e.preventDefault(); loadHistory(); });
+
+async function loadHistory() {
+  const exception = $('[name=exception]').value.trim(), method = $('[name=method]').value.trim();
+  if (!exception && !method) return toast('Enter an exception name and/or a method');
+  const to = new Date(), from = new Date(Date.now() - hDays * 24 * 3600e3);
+  const p = new URLSearchParams({ exception, method, from: from.toISOString(), to: to.toISOString(), tz: Intl.DateTimeFormat().resolvedOptions().timeZone });
+  history.replaceState(null, '', '?' + new URLSearchParams({ mode: 'history', exception, method, days: hDays }));
+  const go = $('#hgo'); go.disabled = true; go.prepend(el('span', { className: 'spinner' })); $('#hgoTxt').textContent = 'Loading…'; $('#err').hidden = true;
+  try { renderHistory(await api('/api/exception-history?' + p)); }
+  catch (err) { $('#err').hidden = false; $('#err').textContent = '⚠ ' + err.message; }
+  finally { go.disabled = false; $('.spinner', go)?.remove(); $('#hgoTxt').textContent = 'Show history'; }
+}
+
+const NOSTACK = 'no stack trace';
+const seriesColor = (key, keep) => key === 'Other' ? 'var(--s-other)' : key === NOSTACK ? 'var(--s-nostack)' : `var(--s${keep.filter(k => k !== NOSTACK).indexOf(key) + 1})`;
+const ago = (iso) => { const h = (Date.now() - new Date(iso)) / 3600e3; return h < 1 ? `${Math.max(1, Math.round(h * 60))} min ago` : h < 48 ? `${Math.round(h)} h ago` : `${Math.round(h / 24)} days ago`; };
+
+function renderHistory(d) {
+  const q = d.query, L = d.lifetime;
+  const title = [q.exception, q.method && `in ${q.method}()`].filter(Boolean).join(' ');
+  const out = [];
+  if (!d.total && !L.last) { $('#out').replaceChildren(el('section', { className: 'card' }, el('div', { className: 'empty' }, el('div', { className: 'big' }, 'No errors found'), 'Check the exception name / method (exact, case-sensitive). Logs are kept ~30 days.'))); return; }
+  const active = L.last24h > 0;
+  /* tiles */
+  out.push(el('section', { className: 'card' },
+    el('div', { className: 'card-h' }, el('h2', { className: 'mono' }, title),
+      el('span', { className: 'pill', style: { '--c': active ? 'var(--critical)' : 'var(--good)' } }, el('span', { className: 'ico', textContent: active ? '●' : '✓' }), active ? 'Still happening' : 'Not seen in 24h')),
+    el('div', { className: 'card-b' }, el('div', { className: 'tiles' },
+      tile(`In range (${hDays === 1 ? '24h' : hDays + ' days'})`, d.total.toLocaleString()),
+      tile('Last 24 hours', L.last24h.toLocaleString(), active ? 'var(--critical)' : 'var(--good)'),
+      tile('Last seen', L.last ? fmtDate(L.last) : '—', null, L.last ? ago(L.last) : ''),
+      tile('First seen (in logs)', L.first ? fmtDate(L.first) : '—', null, 'logs kept ~30 days'),
+      tile('Code locations', String(d.locations.length), null, d.locations.length ? `top: ${d.locations[0].key.split(':')[0].split('.').pop()}` : '')))));
+  /* chart */
+  out.push(chartCard(d));
+  /* locations */
+  out.push(el('section', { className: 'card' },
+    el('div', { className: 'card-h' }, el('h2', {}, 'Where in the code'), el('span', { className: 'muted', style: { fontSize: '12.5px' } }, 'Estimated from up to 120 sampled stack traces per time bucket')),
+    el('div', {}, d.locations.map((l) => locRow(l, d)))));
+  /* hosts + messages + sessions */
+  out.push(el('div', { className: 'grid2' },
+    el('section', { className: 'card' }, el('div', { className: 'card-h' }, el('h2', {}, 'Servers')), el('div', { className: 'card-b' }, barList(d.hosts, (k) => k.replace('ndc-prd-ne-', '')))),
+    el('section', { className: 'card' }, el('div', { className: 'card-h' }, el('h2', {}, 'Logged messages')), el('div', { className: 'card-b' }, barList(d.exceptions.length > 1 ? d.exceptions : d.messages, (k) => k)))));
+  out.push(el('section', { className: 'card' },
+    el('div', { className: 'card-h' }, el('h2', {}, 'Recent sessions'), el('span', { className: 'muted', style: { fontSize: '12.5px' } }, 'Open one to see the whole session explained')),
+    el('table', { className: 'tbl' }, el('thead', {}, el('tr', {}, ['Time', 'Server', 'Code location', 'Session', ''].map(h => el('th', { textContent: h })))),
+      el('tbody', {}, d.sessions.map(s => el('tr', {},
+        el('td', { className: 'num' }, fmtDate(s.time)), el('td', { className: 'ink2' }, (s.host || '').replace('ndc-prd-ne-', '')),
+        el('td', { className: 'mono', style: { fontSize: '12px' } }, el('span', { className: 'swatch', style: { background: seriesColor(d.keep.includes(s.loc) ? s.loc : 'Other', d.keep) } }), s.loc),
+        el('td', { className: 'mono muted', style: { fontSize: '12px' } }, s.cid.slice(0, 18) + '…', copyBtn(s.cid)),
+        el('td', {}, el('a', { href: '/exceptions?cid=' + encodeURIComponent(s.cid), className: 'linkbtn', style: { textDecoration: 'none' } }, 'Explain →'))))))));
+  $('#out').replaceChildren(...out);
+}
+
+function tile(label, value, color, sub) {
+  return el('div', { className: 'tile static', style: color ? { '--c': color } : {} }, el('div', { className: 'lab' }, label),
+    el('div', { className: 'val num', style: { fontSize: value.length > 12 ? '17px' : '26px' } }, value), sub ? el('div', { className: 'muted', style: { fontSize: '12px' } }, sub) : null);
+}
+
+function barList(items, label) {
+  const max = Math.max(1, ...items.map(i => i.n));
+  return el('div', { className: 'barlist' }, items.map(i => el('div', { className: 'bl-row' },
+    el('div', { className: 'bl-lab', title: i.key, textContent: label(i.key) }),
+    el('div', { className: 'bl-track' }, el('div', { className: 'bl-bar', style: { width: (i.n / max * 100) + '%' } })),
+    el('div', { className: 'bl-val num', textContent: i.n.toLocaleString() }))));
+}
+
+function locRow(l, d) {
+  const inKeep = d.keep.includes(l.key);
+  const stillActive = l.last && (Date.now() - new Date(l.last)) < 24 * 3600e3;
+  const box = el('div', { className: 'loc-code', hidden: true });
+  const toggle = el('button', { type: 'button', className: 'linkbtn', textContent: l.code ? 'Show code' : '' });
+  toggle.onclick = () => { box.hidden = !box.hidden; toggle.textContent = box.hidden ? 'Show code' : 'Hide code';
+    if (!box.firstChild && l.code) box.append(codeView(l.code, l.frame, (l.hosts[0] || {}).host,
+      { type: d.query.exception, method: d.query.method, frames: [l.frame], count: l.estimated })); };
+  return el('div', { className: 'loc' },
+    el('div', { className: 'loc-main' },
+      el('span', { className: 'swatch', style: { background: seriesColor(inKeep ? l.key : 'Other', d.keep) } }),
+      el('div', { style: { minWidth: 0 } },
+        el('div', { className: 'mono', style: { fontWeight: 600 } }, l.key),
+        el('div', { className: 'muted', style: { fontSize: '12.5px' } },
+          `~${l.estimated.toLocaleString()} (${(l.share * 100).toFixed(1)}%) · ${fmtDate(l.first)} → ${fmtDate(l.last)} · `,
+          l.hosts.slice(0, 3).map(h => `${h.host.replace('ndc-prd-ne-', '')} ${h.n}`).join(', '))),
+      el('div', { style: { flex: 1 } }),
+      el('span', { className: 'pill', style: { '--c': stillActive ? 'var(--critical)' : 'var(--good)' } }, el('span', { className: 'ico', textContent: stillActive ? '●' : '✓' }),
+        stillActive ? 'Active' : `Stopped ${fmtDate(l.last)}`),
+      toggle),
+    l.changes.length ? el('div', { className: 'loc-chg' }, el('span', { className: 'muted' }, `Line changed in ${d.gitRef}: `),
+      l.changes.map(c => el('span', { className: 'chg' }, el('span', { className: 'mono' }, c.hash), ` ${c.date} · ${c.author} · `, el('b', {}, c.subject)))) : null,
+    l.key === NOSTACK ? el('div', { className: 'loc-chg muted' }, 'The JVM omits stack traces for exceptions repeated very often at one place (OmitStackTraceInFastThrow); these are usually the same as the traced locations.') : null,
+    box);
+}
+
+function chartCard(d) {
+  const keys = [...d.keep, 'Other'].filter(k => d.series.some(s => s.parts[k] > 0));
+  const W = 1100, H = 260, P = { l: 48, r: 12, t: 12, b: 28 };
+  const iw = W - P.l - P.r, ih = H - P.t - P.b;
+  const max = Math.max(1, ...d.series.map(s => s.n));
+  const nice = (v) => { const p = Math.pow(10, Math.floor(Math.log10(v))); return Math.ceil(v / p / (v / p > 5 ? 2 : 1)) * p * (v / p > 5 ? 2 : 1); };
+  const ymax = nice(max);
+  const n = d.series.length, bw = iw / n, barW = Math.max(2, Math.min(28, bw - 3));
+  const y = (v) => P.t + ih - (v / ymax) * ih;
+  const NS = 'http://www.w3.org/2000/svg';
+  const s = (tag, attrs, ...kids) => { const e = document.createElementNS(NS, tag); for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v); kids.forEach(k => e.append(k)); return e; };
+  const svg = s('svg', { viewBox: `0 0 ${W} ${H}`, class: 'hchart', role: 'img', 'aria-label': `Errors over time, ${d.total} total` });
+  // grid + y ticks
+  [0, 0.5, 1].forEach(f => { const v = ymax * f, yy = y(v);
+    svg.append(s('line', { x1: P.l, x2: W - P.r, y1: yy, y2: yy, class: f === 0 ? 'axis' : 'grid' }));
+    svg.append(s('text', { x: P.l - 8, y: yy + 4, 'text-anchor': 'end', class: 'tick' }, document.createTextNode(Math.round(v).toLocaleString()))); });
+  // x labels: ~8
+  const every = Math.max(1, Math.ceil(n / 8));
+  const xfmt = (t) => { const dt = new Date(t); return d.query.interval === '1d' ? `${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}` : `${pad(dt.getMonth() + 1)}-${pad(dt.getDate())} ${pad(dt.getHours())}h`; };
+  d.series.forEach((b, i) => { if (i % every === 0) svg.append(s('text', { x: P.l + i * bw + bw / 2, y: H - 8, 'text-anchor': 'middle', class: 'tick' }, document.createTextNode(xfmt(b.t)))); });
+  // bars: stacked, 1px surface gap between segments, rounded top
+  d.series.forEach((b, i) => {
+    const x = P.l + i * bw + (bw - barW) / 2; let acc = 0;
+    const g = s('g', {});
+    keys.forEach(k => { const v = b.parts[k] || 0; if (!v) return;
+      const y0 = y(acc), y1 = y(acc + v); acc += v;
+      g.append(s('rect', { x, y: y1, width: barW, height: Math.max(0.5, y0 - y1 - 1), fill: seriesColor(k, d.keep), rx: 0 })); });
+    // hit target: full column
+    const hit = s('rect', { x: P.l + i * bw, y: P.t, width: bw, height: ih, fill: 'transparent', class: 'hit' });
+    hit.addEventListener('mousemove', (e) => { tip.replaceChildren(
+        el('b', {}, `${fmtDate(b.t)} – ${fmtDate(b.t + ({ '1h': 3600e3, '6h': 6 * 3600e3, '1d': 864e5 })[d.query.interval])}`),
+        el('div', {}, `${b.n.toLocaleString()} errors`),
+        ...keys.filter(k => b.parts[k]).map(k => el('div', { style: { display: 'flex', gap: '6px', alignItems: 'center' } },
+          el('span', { className: 'swatch', style: { background: seriesColor(k, d.keep) } }), `${k}: ~${b.parts[k].toLocaleString()}`)));
+      tip.style.opacity = 1; tip.style.left = Math.min(e.clientX + 14, innerWidth - tip.offsetWidth - 8) + 'px'; tip.style.top = (e.clientY + 16) + 'px'; });
+    hit.addEventListener('mouseleave', () => tip.style.opacity = 0);
+    svg.append(g, hit);
+  });
+  // commit markers (line changes in the range)
+  const t0 = d.series[0].t, step = n > 1 ? d.series[1].t - t0 : 3600e3, tEnd = t0 + step * n;
+  const xOf = (t) => P.l + ((t - t0) / (tEnd - t0)) * iw;
+  const commits = []; const seen = new Set();
+  d.locations.forEach(l => l.changes.forEach(c => { const t = Date.parse(c.iso); if (t >= t0 && t <= tEnd && !seen.has(c.hash)) { seen.add(c.hash); commits.push({ ...c, t, loc: l.key }); } }));
+  commits.forEach(c => { const xx = xOf(c.t);
+    const m = s('g', { class: 'marker' }, s('line', { x1: xx, x2: xx, y1: P.t, y2: P.t + ih }), s('text', { x: xx + 4, y: P.t + 10 }, document.createTextNode(c.hash)));
+    m.addEventListener('mousemove', (e) => { tip.replaceChildren(el('b', {}, `${c.hash} · ${c.date}`), el('div', {}, c.subject), el('div', {}, `${c.author} · changed ${c.loc}`), el('div', { style: { opacity: .75 } }, 'Commit date, not deploy date'));
+      tip.style.opacity = 1; tip.style.left = Math.min(e.clientX + 14, innerWidth - tip.offsetWidth - 8) + 'px'; tip.style.top = (e.clientY + 16) + 'px'; });
+    m.addEventListener('mouseleave', () => tip.style.opacity = 0);
+    svg.append(m); });
+  const legend = el('div', { className: 'legend' }, keys.map(k => { const tot = d.series.reduce((a, b) => a + (b.parts[k] || 0), 0);
+    return el('span', { className: 'lg' }, el('span', { className: 'swatch', style: { background: seriesColor(k, d.keep) } }), el('span', { className: 'mono' }, k), el('span', { className: 'muted num' }, ` ~${tot.toLocaleString()}`)); }),
+    commits.length ? el('span', { className: 'lg' }, el('span', { className: 'swatch marker-sw' }), 'commit changing a failing line') : null);
+  return el('section', { className: 'card' },
+    el('div', { className: 'card-h' }, el('h2', {}, 'Errors over time'), el('span', { className: 'muted', style: { fontSize: '12.5px' } }, `per ${d.query.interval === '1d' ? 'day' : d.query.interval === '6h' ? '6 hours' : 'hour'} · split by code location · your local time`)),
+    el('div', { className: 'card-b' }, legend, svg));
+}
+
+/* init */
+const QS = new URLSearchParams(location.search);
+if (QS.get('theme')) setTheme(QS.get('theme'));
+if (QS.get('mode') === 'changes') {
+  setMode('changes'); $('#out').replaceChildren(emptyFor('changes'));
+  if (QS.get('at')) { $('[name=at]').value = toLocalInput(new Date(QS.get('at'))); loadChanges(); }
+} else if (QS.get('mode') === 'history') {
+  setMode('history'); $('#out').replaceChildren(emptyFor('history'));
+  $('[name=exception]').value = QS.get('exception') || ''; $('[name=method]').value = QS.get('method') || '';
+  if (QS.get('days')) { hDays = +QS.get('days'); document.querySelectorAll('#hRange button').forEach(b => b.setAttribute('aria-pressed', String(+b.dataset.d === hDays))); }
+  if (QS.get('exception') || QS.get('method')) loadHistory();
+} else {
+  const qcid = QS.get('cid');
+  if (qcid) { $('[name=cid]').value = qcid; load(qcid); }
+}
+</script>
+</body>
+</html>
