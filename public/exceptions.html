@@ -6,6 +6,7 @@
 <title>NDC · Exceptions</title>
 <script>document.documentElement.dataset.theme = localStorage.getItem('nb-theme') || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');</script>
 <link rel="stylesheet" href="/app.css">
+<link rel="stylesheet" href="/crm.css">
 </head>
 <body>
 <header class="bar">
@@ -76,6 +77,7 @@
 <div class="toast" id="toast"></div>
 
 <script src="/common.js"></script>
+<script src="/crm-ui.js"></script>
 <script>
 const IMPACT = {
   blocking: { c: 'var(--critical)', i: '✕', label: 'Blocks booking' },
@@ -89,9 +91,11 @@ $('#f').addEventListener('submit', (e) => { e.preventDefault(); const cid = $('[
 async function load(cid) {
   history.replaceState(null, '', '?cid=' + encodeURIComponent(cid));
   const go = $('#go'); go.disabled = true; go.prepend(el('span', { className: 'spinner' })); $('#goTxt').textContent = 'Analysing…'; $('#err').hidden = true;
-  try { render(cid, await api('/api/exceptions?cid=' + encodeURIComponent(cid))); }
+  const stop = loadingPanel(go.closest('section'), { name: 'explain', estimate: 5, title: 'Explaining the exceptions', steps: ['Reading the session logs', 'Parsing stack traces', 'Locating the code', 'Writing explanations'] });
+  let ok = false;
+  try { render(cid, await api('/api/exceptions?cid=' + encodeURIComponent(cid))); ok = true; }
   catch (e) { $('#err').hidden = false; $('#err').textContent = '⚠ ' + e.message; }
-  finally { go.disabled = false; $('.spinner', go)?.remove(); $('#goTxt').textContent = 'Explain exceptions'; }
+  finally { stop(ok); go.disabled = false; $('.spinner', go)?.remove(); $('#goTxt').textContent = 'Explain exceptions'; }
 }
 
 function render(cid, d) {
@@ -346,9 +350,11 @@ async function loadChanges() {
   const at = new Date($('[name=at]').value).toISOString();
   history.replaceState(null, '', '?' + new URLSearchParams({ mode: 'changes', at }));
   const go = $('#cgo'); go.disabled = true; go.prepend(el('span', { className: 'spinner' })); $('#cgoTxt').textContent = 'Comparing…'; $('#err').hidden = true;
-  try { renderChanges(await api('/api/changes?at=' + encodeURIComponent(at))); }
+  const stop = loadingPanel(go.closest('section'), { name: 'changes', estimate: 12, title: 'Comparing error signatures', steps: ['Counting errors after the change', 'Counting the baseline (3 previous days)', 'Locating new errors in the code'] });
+  let ok = false;
+  try { renderChanges(await api('/api/changes?at=' + encodeURIComponent(at))); ok = true; }
   catch (err) { $('#err').hidden = false; $('#err').textContent = '⚠ ' + err.message; }
-  finally { go.disabled = false; $('.spinner', go)?.remove(); $('#cgoTxt').textContent = 'Compare'; }
+  finally { stop(ok); go.disabled = false; $('.spinner', go)?.remove(); $('#cgoTxt').textContent = 'Compare'; }
 }
 const CHG = { new: ['var(--critical)', '✚', 'New'], increased: ['var(--serious)', '▲', 'Increased'], gone: ['var(--good)', '✓', 'Gone'], decreased: ['var(--good)', '▼', 'Decreased'] };
 function renderChanges(d) {
@@ -402,9 +408,11 @@ async function loadHistory() {
   const p = new URLSearchParams({ exception, method, from: from.toISOString(), to: to.toISOString(), tz: Intl.DateTimeFormat().resolvedOptions().timeZone });
   history.replaceState(null, '', '?' + new URLSearchParams({ mode: 'history', exception, method, days: hDays }));
   const go = $('#hgo'); go.disabled = true; go.prepend(el('span', { className: 'spinner' })); $('#hgoTxt').textContent = 'Loading…'; $('#err').hidden = true;
-  try { renderHistory(await api('/api/exception-history?' + p)); }
+  const stop = loadingPanel(go.closest('section'), { name: 'history', estimate: 8, title: 'Loading exception history', steps: ['Searching occurrences', 'Grouping by day', 'Matching code changes'] });
+  let ok = false;
+  try { renderHistory(await api('/api/exception-history?' + p)); ok = true; }
   catch (err) { $('#err').hidden = false; $('#err').textContent = '⚠ ' + err.message; }
-  finally { go.disabled = false; $('.spinner', go)?.remove(); $('#hgoTxt').textContent = 'Show history'; }
+  finally { stop(ok); go.disabled = false; $('.spinner', go)?.remove(); $('#hgoTxt').textContent = 'Show history'; }
 }
 
 const NOSTACK = 'no stack trace';

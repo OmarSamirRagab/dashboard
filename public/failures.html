@@ -6,6 +6,7 @@
 <title>NDC · Booking failures</title>
 <script>document.documentElement.dataset.theme = localStorage.getItem('nb-theme') || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');</script>
 <link rel="stylesheet" href="/app.css">
+<link rel="stylesheet" href="/crm.css">
 </head>
 <body>
 <header class="bar">
@@ -30,50 +31,230 @@
       <label class="field"><span>To</span><input type="datetime-local" name="to"></label>
       <label class="field"><span>Agency <span class="muted" style="font-weight:400">optional</span></span><input type="text" name="agency" placeholder="AGN12210" list="agList"></label>
       <label class="field"><span>Supplier <span class="muted" style="font-weight:400">optional</span></span><input type="text" name="supplier" placeholder="Galileo" list="supList"></label>
+      <label class="field"><span>PNR <span class="muted" style="font-weight:400">focus</span></span><input type="text" name="pnr" placeholder="ABC123" class="mono" style="width:120px;text-transform:uppercase"></label>
+      <label class="field"><span>Correlation id <span class="muted" style="font-weight:400">focus</span></span><input type="text" name="cid" placeholder="session id" class="mono" style="width:300px"></label>
       <button class="primary" id="go"><span id="goTxt">Load failures</span></button>
+      <button class="iconbtn" type="button" id="clearFocus" title="Clear PNR / correlation id" hidden>✕ Clear focus</button>
       <datalist id="agList"></datalist><datalist id="supList"></datalist>
     </form>
     <div class="card-b hint" style="padding-top:0">Failed bookings = <span class="mono">handleBookingException</span> ("Booking Has been failed!"),
       <span class="mono">logBookingFailedBeforeSupplierCall</span> and <span class="mono">processMakePayment</span> errors, joined per session and booking ref.
-      Agency and supplier come from the same session. Times are your local time.</div>
+      Agency and supplier come from the same session. Times are your local time.
+      <b>PNR</b>: only the failures of that PNR (agency/supplier filters are ignored). <b>Correlation id</b>: one session. Both always search the last 30 days; the PNR is matched in every field, including supplier responses.</div>
     <div id="err" class="err card-b" style="padding-top:0" hidden></div>
   </section>
 
   <div id="out" style="display:grid;gap:16px">
-    <section class="card"><div class="empty"><div class="big">Loading the last 24 hours…</div></div></section>
+
   </div>
 </main>
 <div class="tip" id="tip"></div>
 <div class="toast" id="toast"></div>
+<div class="scrim" id="scrim"></div>
+<aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-label="Explain failure">
+  <div class="dh" id="dh"></div>
+  <div class="db" id="db"></div>
+</aside>
 
 <script src="/common.js"></script>
+<script src="/crm-ui.js"></script>
 <script>
 const toLocal = (d) => new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
 const preset = (h) => { $('[name=from]').value = toLocal(new Date(Date.now() - h * 3600e3)); $('[name=to]').value = toLocal(new Date());
   document.querySelectorAll('#presets button').forEach(b => b.setAttribute('aria-pressed', String(+b.dataset.h === h))); };
 $('#presets').onclick = (e) => { if (e.target.dataset.h) { preset(+e.target.dataset.h); load(); } };
 $('#f').addEventListener('submit', (e) => { e.preventDefault(); load(); });
+$('#clearFocus').onclick = () => { $('[name=pnr]').value = ''; $('[name=cid]').value = ''; load(); };
 
-let data = null; const filt = { category: null, agency: null, supplier: null };
+let data = null; const filt = { category: null, agency: null, supplier: null, db: null, message: null };
 
 async function load() {
   const from = new Date($('[name=from]').value), to = new Date($('[name=to]').value);
   const agency = $('[name=agency]').value.trim(), supplier = $('[name=supplier]').value.trim();
+  const pnr = $('[name=pnr]').value.trim().toUpperCase(), cid = $('[name=cid]').value.trim();
   const p = new URLSearchParams({ from: from.toISOString(), to: to.toISOString() }); if (agency) p.set('agency', agency); if (supplier) p.set('supplier', supplier);
+  if (pnr) p.set('pnr', pnr); if (cid) p.set('cid', cid);
+  $('#clearFocus').hidden = !(pnr || cid);
   history.replaceState(null, '', '?' + p);
   const go = $('#go'); go.disabled = true; go.prepend(el('span', { className: 'spinner' })); $('#goTxt').textContent = 'Loading…'; $('#err').hidden = true;
-  try { data = await api('/api/failures?' + p); data.agency = agency; data.supplier = supplier; filt.category = filt.agency = filt.supplier = null; render(); }
+  const stop = loadingPanel(go.closest('section'), { name: 'failures' + (pnr || cid ? '-focus' : ''), estimate: 10, title: pnr || cid ? `Finding the failures of ${pnr ? 'PNR ' + pnr : 'this session'}` : 'Loading failed bookings',
+    steps: [pnr || cid ? 'Finding the sessions in the last 30 days' : 'Searching failed bookings in OpenSearch', 'Joining sessions and booking refs', 'Adding agency, supplier and PNR', 'Classifying (FAILURE_MESSAGES + backend code)'] });
+  let ok = false;
+  try { data = await api('/api/failures?' + p); ok = true; data.agency = agency; data.supplier = supplier; applyDbClassification(); msgPage = 1; filt.category = filt.agency = filt.supplier = filt.db = filt.message = null; render(); }
   catch (e) { $('#err').hidden = false; $('#err').textContent = '⚠ ' + e.message; }
-  finally { go.disabled = false; $('.spinner', go)?.remove(); $('#goTxt').textContent = 'Load failures'; }
+  finally { stop(ok); go.disabled = false; $('.spinner', go)?.remove(); $('#goTxt').textContent = 'Load failures'; }
 }
 
+// Same key as the server (lib/crm.js failureKey): session + ref + reason.
+const fKey = (r) => [r.cid || '', r.ref || '', (r.reason || '').slice(0, 200)].join('|');
+let tPage = 1, tSize = +localStorage.getItem('nb-fail-size') || 25;
 const count = (rows, f) => { const m = new Map(); rows.forEach(r => { for (const k of [].concat(f(r))) if (k) m.set(k, (m.get(k) || 0) + 1); }); return [...m.entries()].sort((a, b) => b[1] - a[1]); };
 const UNK = '(unknown)';
-const shown = () => data.rows.filter(r => (!filt.category || r.category === filt.category)
+// One failure message = supplier + message text (same grouping as the Failure messages card).
+const msgKey = (r) => (r.supplier || '(unknown)') + '\u0001' + (r.raw || r.reason || '').slice(0, 300);
+// except = 'message': ignore the message filter (the Failure messages card keeps listing every message).
+const shown = (except) => data.rows.filter(r => (!filt.message || except === 'message' || msgKey(r) === filt.message)
+  && (!filt.category || r.category === filt.category)
   && (!filt.agency || (filt.agency === UNK ? !r.agencyCode : r.agencyCode === filt.agency))
-  && (!filt.supplier || (filt.supplier === UNK ? !r.supplier : r.supplier === filt.supplier)));
+  && (!filt.supplier || (filt.supplier === UNK ? !r.supplier : r.supplier === filt.supplier))
+  && (!filt.db || (filt.db === 'classified' ? isClassified(r) : !isClassified(r))));
+const dbOn = () => data && data.db && data.db.loaded;
+// Classified = in FAILURE_MESSAGES, or the message is produced by the backend code itself (r.backend, from lib/backend.js).
+const isClassified = (r) => !!(r.db || r.backend);
+// With the DB connected, FAILURE_MESSAGES decides: a failure not found there is "Other / unclassified" whatever rules.js
+// says (the rule's reason is kept as a hint); a found one is never shown as unclassified.
+function applyDbClassification() {
+  if (!dbOn()) return;
+  for (const r of data.rows) {
+    r.ruleCategory = r.category;
+    if (!isClassified(r)) r.category = 'Other / unclassified';
+    else if (r.category === 'Other / unclassified') r.category = r.db ? (r.db.category ? 'DB · ' + r.db.category : 'Classified in DB') : 'Handled in backend code';
+  }
+}
+// Draft Flyway migration (same style as the BF_classification migrations) for an unclassified message.
+const migrationSql = (msg, supplier) => `INSERT INTO FAILURE_MESSAGES(\`ERROR_MESSAGE\`, \`FRIENDLY_MESSAGE\`, \`FAILURE_MSG_CATEGORY\`, \`SUPPLIER_ID\`, \`DESCRIPTION\`, \`STATUS\`)
+VALUES (
+           '${msg.replace(/'/g, "''")}',
+           'TODO: friendly message shown to the agent',
+           (SELECT INT_CODE FROM wonderdb.TT_ENUM_VALUES WHERE TYPE_NAME = 'FAILURE_MSG_CATEGORY' AND VALUE = 'TODO_CATEGORY'),
+           (SELECT SUPPLIER_ID FROM wonderdb.TT_TS_SUPPLIER WHERE supplier_name = '${(supplier || 'TODO').replace(/'/g, "''")}'),
+           'TODO: description',
+           0
+       );
+
+/*DELETE FROM FAILURE_MESSAGES
+WHERE ERROR_MESSAGE = '${msg.replace(/'/g, "''")}'
+  AND SUPPLIER_ID = (SELECT SUPPLIER_ID FROM wonderdb.TT_TS_SUPPLIER WHERE supplier_name = '${(supplier || 'TODO').replace(/'/g, "''")}');*/`;
+const openCode = async (b) => { try { await api('/api/open-ide', { path: b.path, line: b.line }); toast('Opened ' + b.file + ':' + b.line + ' in IntelliJ'); } catch (e) { toast('⚠ ' + e.message); } };
+const backendBadge = (b) => { const x = el('button', { type: 'button', className: 'pill', style: { '--c': 'var(--good)', cursor: 'pointer' },
+  title: `Produced by the backend code (${b.places} place(s)) – click to open in IntelliJ
+${b.path}:${b.line}
+${b.text}` }, el('span', { className: 'ico', textContent: '</>' }), `Backend code · ${b.file}:${b.line}`);
+  x.onclick = () => openCode(b); return x; };
+const dbBadge = (r) => r.backend && !r.db ? backendBadge(r.backend) : !dbOn() ? null : r.db
+  ? el('span', { className: 'pill', style: { '--c': 'var(--good)' }, title: `FAILURE_MESSAGES #${r.db.id}${r.db.sameSupplier ? '' : ' (matched under supplier ' + r.db.supplier + ')'}\nFriendly: ${r.db.friendlyMessage}\n${r.db.description}` },
+      el('span', { className: 'ico', textContent: '✓' }), `DB #${r.db.id}${r.db.category ? ' · ' + r.db.category : ''}${r.db.sameSupplier ? '' : ' *'}`)
+  : el('span', { className: 'pill', style: { '--c': 'var(--critical)' }, title: 'Not found in FAILURE_MESSAGES for this supplier and not produced by the backend code' }, el('span', { className: 'ico', textContent: '?' }), 'Unclassified');
+
+// Distinct failure messages (per supplier) split into classified (FAILURE_MESSAGES or backend code) and unclassified.
+let msgTab = 'unclassified', msgPage = 1, msgSize = +localStorage.getItem('nb-msg-size') || 15;
+/* ===== Explain one failure: the problem + what the supplier answered (side panel) ===== */
+const closeX = () => { $('#drawer').classList.remove('open'); $('#scrim').classList.remove('open'); };
+$('#scrim').onclick = closeX; document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeX(); });
+const xSec = (title, ...kids) => el('section', { className: 'card xp-sec' }, el('div', { className: 'card-h' }, el('h2', {}, title)), el('div', { className: 'card-b' }, ...kids));
+const xList = (label, items) => items && items.length ? el('div', { className: 'xp-list' }, el('b', {}, label), el('ul', {}, items.map((t) => el('li', {}, t)))) : null;
+function xMeaning(ex, hideTitle) {
+  if (!ex) return null;
+  const parts = [];
+  if (ex.db) parts.push(el('div', {}, el('span', { className: 'pill', style: { '--c': 'var(--good)' } }, `DB #${ex.db.id}${ex.db.category ? ' · ' + ex.db.category : ''}`),
+    ex.db.friendlyMessage ? el('span', {}, ' Shown to agent: ', el('b', {}, ex.db.friendlyMessage)) : null, ex.db.description ? el('div', { className: 'muted' }, ex.db.description) : null));
+  if (ex.title) parts.push(el('div', {}, ex.title === hideTitle ? null : el('b', {}, ex.title), ex.what ? el('div', {}, ex.what) : null, ex.cause ? el('div', { className: 'muted' }, 'Why: ' + ex.cause) : null));
+  if (ex.agent && ex.agent.length) parts.push(xList('Agent / support', ex.agent));
+  if (ex.dev && ex.dev.length) parts.push(xList('Development', ex.dev));
+  return parts.length ? el('div', { className: 'xp-meaning' }, parts) : el('div', { className: 'muted' }, 'No explanation known yet for this text (not in rules.js nor FAILURE_MESSAGES).');
+}
+async function explainFailure(r) {
+  $('#dh').replaceChildren(el('div', { className: 'dh-top' }, el('h3', {}, '🔍 Why did this booking fail?'), el('div', { style: { flex: 1 } }),
+      el('button', { type: 'button', className: 'iconbtn', onclick: closeX }, '✕ Close')),
+    el('div', { className: 'meta' }, r.ref ? el('span', {}, 'Ref ', el('b', {}, r.ref)) : null, r.pnr ? el('span', {}, 'PNR ', el('b', {}, r.pnr)) : null,
+      el('span', {}, 'Supplier ', el('b', {}, r.supplier || '—')), el('span', {}, 'Agency ', el('b', {}, [r.agencyCode, r.agencyName].filter(Boolean).join(' · ') || '—')),
+      el('span', {}, 'Failed at ', el('b', {}, fmtDate(r.time))), el('span', { className: 'mono', title: r.cid }, r.cid.slice(0, 18) + '…', copyBtn(r.cid))));
+  const body = $('#db'); body.replaceChildren(el('div', {}));
+  $('#drawer').classList.add('open'); $('#scrim').classList.add('open');
+  const stop = loadingPanel(body.firstChild, { name: 'failexplain', estimate: 4, title: 'Reading the supplier calls of this session', steps: ['Finding supplier calls before the failure', 'Reading their responses', 'Explaining the errors'] });
+  let x;
+  try { x = await api('/api/failure-explain?' + new URLSearchParams({ cid: r.cid, time: r.time, supplier: r.supplier || '', reason: r.raw || r.reason || '' })); stop(true); }
+  catch (e) { stop(false); body.replaceChildren(el('div', { className: 'err' }, '⚠ ' + e.message)); return; }
+  const out = [];
+  // 1. The problem
+  out.push(xSec('1 · The problem',
+    el('div', { className: 'xp-summary' }, x.summary),
+    el('div', { style: { display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap', marginTop: '10px' } }, el('b', {}, r.category), dbBadge(r)),
+    el('div', { className: 'mono xp-msg' }, r.raw || r.reason),
+    xMeaning(x.problem, r.category),
+    r.action ? el('div', { style: { marginTop: '8px' } }, el('b', {}, 'What to do: '), r.action) : null));
+  // 2. What the supplier answered
+  if (!x.calls.length) out.push(xSec('2 · What the supplier answered', el('div', { className: 'muted' }, 'No supplier call logged in this session in the 30 minutes before the failure. The booking stopped in our system before (or without) calling the supplier.')));
+  x.calls.forEach((c, i) => {
+    const okStatus = c.status && Number(c.status) === 200;
+    out.push(xSec(i === 0 ? '2 · What the supplier answered' : `Earlier call ${i}`,
+      el('div', { className: 'xp-call' },
+        el('span', { className: 'pill', style: { '--c': okStatus && !c.errors.length ? 'var(--good)' : 'var(--critical)' } }, c.status ? `HTTP ${c.status}` : 'no status'),
+        el('b', {}, `${c.service || '?'} · ${c.action || c.method || 'call'}`),
+        el('span', { className: 'muted' }, `${fmtTime(c.time)} · ${Math.round((Date.parse(r.time) - Date.parse(c.time)) / 1000)} s before the failure`)),
+      c.errors.length ? el('div', { className: 'xp-errs' }, c.errors.map((e) => el('div', { className: 'xp-err ' + e.kind },
+        el('div', { className: 'xp-err-h' }, el('span', { className: 'pill', style: { '--c': e.kind === 'warning' ? 'var(--warning)' : 'var(--critical)' } }, e.kind === 'warning' ? 'Warning' : 'Error'),
+          e.code ? el('span', { className: 'mono' }, 'code ' + e.code) : null, e.type ? el('span', { className: 'muted' }, e.type) : null, el('span', { className: 'muted mono', style: { fontSize: '11px' } }, `<${e.tag}>`)),
+        el('div', { className: 'mono xp-msg' }, e.text, copyBtn(e.text)),
+        el('div', { className: 'xp-means' }, el('span', { className: 'muted' }, 'Meaning → '), xMeaning(e.explain)))))
+        : el('div', { className: 'muted', style: { margin: '8px 0' } }, okStatus ? 'The supplier answered without an error element: the failure was decided by our system after this response (check the message above and the backend code).' : 'No error element found in the response; read the response below.'),
+      el('div', { className: 'payload' }, c.response ? payloadBlock('supplier response', c.response) : el('div', { className: 'muted' }, 'No response body logged.'),
+        c.request ? el('details', { className: 'xp-req' }, el('summary', {}, 'Request sent to the supplier'), payloadBlock('request', c.request)) : null)));
+  });
+  if (x.otherCalls.length) out.push(xSec('Other calls in this session (newest first)', el('table', { className: 'tbl' },
+    el('tbody', {}, x.otherCalls.map((c) => el('tr', {}, el('td', { className: 'num' }, fmtTime(c.time)), el('td', {}, c.service), el('td', {}, c.action || ''),
+      el('td', {}, el('span', { className: 'pill', style: { '--c': Number(c.status) === 200 ? 'var(--good)' : 'var(--critical)' } }, c.status ? 'HTTP ' + c.status : '—'))))))));
+  out.push(el('div', { className: 'muted', style: { fontSize: '12px' } }, 'Full timeline: ',
+    r.ref ? el('a', { href: '/?refs=' + encodeURIComponent(`${r.ref} ${fmtDate(r.time)}`) }, 'Case page') : null, ' · ', el('a', { href: '/exceptions?cid=' + encodeURIComponent(r.cid) }, 'Exceptions'), ' · ',
+    el('a', { href: osdLink(r.cid), target: '_blank', rel: 'noopener' }, 'OpenSearch')));
+  body.replaceChildren(...out);
+}
+
+// Click a message: the Failed bookings table shows only its bookings (click again or ✕ to show all).
+function showMessage(k) { filt.message = filt.message === k ? null : k; render();
+  if (filt.message) requestAnimationFrame(() => $('#failTable')?.scrollIntoView({ behavior: 'smooth', block: 'start' })); }
+function messagesCard(rows) {
+  const groups = new Map();
+  for (const r of rows) { const k = msgKey(r), [sup, msg] = k.split('\u0001');
+    if (!groups.has(k)) groups.set(k, { k, sup, msg, n: 0, r }); groups.get(k).n++; }
+  const all = [...groups.values()].sort((a, b) => b.n - a.n);
+  const kind = (g) => g.r.db ? 'db' : g.r.backend ? 'code' : 'none';
+  const sets = { unclassified: all.filter((g) => kind(g) === 'none'), classified: all.filter((g) => kind(g) !== 'none'), all };
+  const fails = (list) => list.reduce((s, g) => s + g.n, 0);
+  const card = el('section', { className: 'card' }); const body = el('div');
+  const draw = () => {
+    const list = sets[msgTab]; const pages = Math.max(1, Math.ceil(list.length / msgSize)); if (msgPage > pages) msgPage = pages;
+    const tabs = el('div', { className: 'seg', role: 'tablist' }, [['unclassified', 'Unclassified', 'var(--critical)'], ['classified', 'Classified', 'var(--good)'], ['all', 'All', 'var(--accent)']].map(([k, label, c]) => {
+      const b = el('button', { type: 'button', role: 'tab', 'aria-pressed': String(msgTab === k), title: `${sets[k].length} distinct message(s), ${fails(sets[k])} failed booking(s)` },
+        el('span', { className: 'swatch', style: { background: c, marginRight: '6px' } }), `${label} `, el('b', {}, String(sets[k].length)), el('span', { className: 'muted' }, ` · ${fails(sets[k])}`));
+      b.onclick = () => { msgTab = k; msgPage = 1; draw(); }; return b; }));
+    const status = (g) => { const k = kind(g);
+      if (k === 'db') return el('div', {}, dbBadge(g.r), g.r.db.friendlyMessage ? el('div', { className: 'muted', style: { fontSize: '12px', marginTop: '3px' } }, 'Shown to agent: ' + g.r.db.friendlyMessage) : null);
+      if (k === 'code') return el('div', {}, backendBadge(g.r.backend), el('div', { className: 'muted', style: { fontSize: '12px', marginTop: '3px' } }, 'Message produced by the backend code'));
+      return el('div', {}, el('span', { className: 'pill', style: { '--c': 'var(--critical)' } }, el('span', { className: 'ico', textContent: '?' }), 'Unclassified'),
+        g.r.ruleCategory && g.r.ruleCategory !== 'Other / unclassified' ? el('div', { className: 'muted', style: { fontSize: '12px', marginTop: '3px' } }, 'Rule hint: ' + g.r.ruleCategory) : null); };
+    body.replaceChildren(
+      el('div', { className: 'card-b', style: { display: 'flex', gap: '12px', alignItems: 'center', flexWrap: 'wrap', paddingBottom: '0' } }, tabs,
+        el('span', { className: 'muted', style: { fontSize: '12.5px' } }, msgTab === 'unclassified' ? 'Not in FAILURE_MESSAGES and not produced by the backend code – copy a draft migration for frequent ones'
+          : msgTab === 'classified' ? 'Found in FAILURE_MESSAGES (DB #id · category) or produced by the backend code (click to open it)' : 'Every distinct message, most frequent first')),
+      list.length ? el('table', { className: 'tbl' }, el('thead', {}, el('tr', {}, ['Count', 'Supplier', 'Message', 'Classification', ''].map(h => el('th', { textContent: h })))),
+        el('tbody', {}, pageSlice(list, msgPage, msgSize).map((g) => el('tr', { className: 'msg-row' + (filt.message === g.k ? ' sel' : ''),
+            title: `Click to show the ${g.n} failed booking(s) with this message`, onclick: (e) => { if (!e.target.closest('button, a')) showMessage(g.k); } },
+          el('td', { className: 'num', style: { fontWeight: 700 } }, String(g.n)), el('td', { className: 'ink2' }, g.sup),
+          el('td', { className: 'mono', style: { fontSize: '12px', maxWidth: '520px' } }, g.msg, copyBtn(g.msg)),
+          el('td', { style: { maxWidth: '340px' } }, status(g)),
+          el('td', { style: { whiteSpace: 'nowrap' } },
+            el('button', { type: 'button', className: 'linkbtn', onclick: () => showMessage(g.k) }, filt.message === g.k ? '✓ Shown below' : `${g.n} booking${g.n > 1 ? 's' : ''} →`),
+            kind(g) === 'none' ? el('div', { style: { marginTop: '4px' } }, copyBtn(migrationSql(g.msg, g.sup === '(unknown)' ? '' : g.sup), '⧉ migration SQL')) : null)))))
+        : el('div', { className: 'empty' }, msgTab === 'unclassified' ? '🎉 Every message is classified' : 'No classified message in this range'),
+      list.length > msgSize ? paginator({ total: list.length, page: msgPage, size: msgSize, sizes: [15, 30, 50, 100],
+        onChange: (p, s) => { msgPage = p; msgSize = s; localStorage.setItem('nb-msg-size', s); draw(); } }) : '');
+  };
+  card.append(el('div', { className: 'card-h' }, el('h2', {}, `Failure messages (${all.length} distinct message/supplier)`),
+    el('span', { className: 'muted', style: { fontSize: '12.5px' } }, `${data.db.count} classifications loaded from ${data.db.database} at ${fmtDate(data.db.loadedAt)}`)), body);
+  draw(); return card;
+}
 
 function render() {
+  const fc = data.focus;
+  if (fc && !data.rows.length) {
+    $('#out').replaceChildren(el('section', { className: 'card' }, el('div', { className: 'empty' },
+      el('div', { className: 'big' }, `No failed booking found for ${[fc.pnr && 'PNR ' + fc.pnr, fc.cid && 'session ' + fc.cid.slice(0, 16) + '…'].filter(Boolean).join(' + ')}`),
+      fc.sessions ? `${fc.sessions} session(s) mention it in the last 30 days, but none has a booking failure. Check it on the Cases page or with Explain.`
+        : 'Nothing in the last 30 days mentions it (logs are kept ~30 days). Check the spelling.',
+      fc.cid ? el('div', { style: { marginTop: '10px' } }, el('a', { className: 'linkbtn', href: '/exceptions?cid=' + encodeURIComponent(fc.cid) }, 'Explain this session →')) : null)));
+    return;
+  }
   const all = data.rows; const rows = shown();
   // Colour follows the reason (top 5 real reasons); "unclassified" is always neutral, the rest fold into "Other reasons".
   const UNCL = 'Other / unclassified';
@@ -89,7 +270,9 @@ function render() {
   out.push(el('section', { className: 'card' },
     el('div', { className: 'card-h' }, el('h2', {}, 'Overview'),
       el('span', { className: 'muted', style: { fontSize: '12.5px' } }, `${fmtDate(data.from)} → ${fmtDate(data.to)}${data.agency ? ' · agency ' + data.agency : ''}${data.supplier ? ' · supplier ' + data.supplier : ''}`),
-      active.length ? el('span', { className: 'chips' }, active.map(([k, v]) => { const c = el('button', { type: 'button', className: 'chip', title: 'Remove filter' }, `${k}: ${v} ✕`); c.onclick = () => { filt[k] = null; render(); }; return c; })) : null,
+      data.focus ? el('span', { className: 'pill', style: { '--c': 'var(--accent)' } }, el('span', { className: 'ico', textContent: '⌖' }),
+        `Focus: ${[data.focus.pnr && 'PNR ' + data.focus.pnr, data.focus.cid && 'session ' + data.focus.cid.slice(0, 12) + '…'].filter(Boolean).join(' + ')} · ${data.focus.sessions} session(s) · last 30 days`) : null,
+      active.length ? el('span', { className: 'chips' }, active.map(([k, v]) => { const c = el('button', { type: 'button', className: 'chip', title: 'Remove filter' }, `${k}: ${k === 'message' ? ((t) => t.length > 60 ? t.slice(0, 60) + '…' : t)(v.split('\u0001').reverse().join(' · ')) : v} ✕`); c.onclick = () => { filt[k] = null; render(); }; return c; })) : null,
       el('div', { style: { flex: 1 } }),
       el('button', { className: 'iconbtn', type: 'button', onclick: sendFailures }, '💬 Send to team leader'),
       el('button', { className: 'iconbtn', type: 'button', onclick: exportPdf }, '⤓ Export PDF'),
@@ -99,7 +282,15 @@ function render() {
         tile('Failed bookings', rows.length.toLocaleString(), 'var(--critical)', data.truncated ? 'limit reached – narrow the range' : `${data.events.toLocaleString()} log events`),
         tile('Booking refs', refs.toLocaleString()), tile('Agencies affected', ags.toLocaleString()),
         tile('Top reason', rc ? rc[0] : '—', rc ? colorOf(rc[0]) : null, rc ? `${rc[1]} · ${Math.round(rc[1] / rows.length * 100)}%` : ''),
-        tile('Banque Misr sessions', rows.filter(r => r.banqueMisr).length.toLocaleString(), 'var(--serious)', 'counted as not booked')),
+        tile('Banque Misr sessions', rows.filter(r => r.banqueMisr).length.toLocaleString(), 'var(--serious)', 'counted as not booked'),
+        ...(dbOn() ? ['classified', 'unclassified'].map((k) => { const n = rows.filter((r) => (k === 'classified' ? isClassified(r) : !isClassified(r))).length; const nCode = k === 'classified' ? rows.filter((r) => !r.db && r.backend).length : 0;
+          const b = el('button', { type: 'button', className: 'tile', style: { '--c': k === 'classified' ? 'var(--good)' : 'var(--critical)' }, 'aria-pressed': String(!filt.db || filt.db === k), title: 'Click to show only these' },
+            el('div', { className: 'lab' }, k === 'classified' ? 'Classified (DB or backend code)' : 'Unclassified (not in DB, not in code)'),
+            el('div', { className: 'val num' }, n.toLocaleString(), el('small', {}, rows.length ? `${Math.round(n / rows.length * 100)}%` : '')), nCode ? el('div', { className: 'muted', style: { fontSize: '12px' } }, `${n - nCode} in DB · ${nCode} by backend code`) : null);
+          b.onclick = () => { filt.db = filt.db === k ? null : k; render(); }; return b; }) : [])),
+      !dbOn() ? el('div', { className: 'notice', style: { marginTop: '12px', fontSize: '13px' } },
+        el('b', {}, data.db && data.db.configured ? '⚠ Classification DB error' : 'Classification DB not connected'),
+        el('span', {}, data.db && data.db.error ? data.db.error : 'Restart the dashboard with start.ps1 and enter the UAT database host:port, user and password to split failures into classified (wonderdb.FAILURE_MESSAGES) and unclassified.')) : null,
       el('div', { style: { marginTop: '14px' } }, chart(rows, topCats, colorOf)))));
   /* breakdowns */
   const bl = (title, items, key, label, colorFn) => el('section', { className: 'card' }, el('div', { className: 'card-h' }, el('h2', {}, title), el('span', { className: 'muted', style: { fontSize: '12px' } }, 'click to filter')),
@@ -108,38 +299,74 @@ function render() {
     bl('By reason', count(rows, r => r.category), 'category', k => k, colorOf),
     bl('By agency', count(rows, r => r.agencyCode || '(unknown)'), 'agency', k => { const r = rows.find(x => x.agencyCode === k); return r && r.agencyName ? `${k} · ${r.agencyName}` : k; }),
     bl('By supplier', count(rows, r => r.supplier ? r.supplier.split(/,\s*/) : '(unknown)'), 'supplier', k => k)));
-  /* messages no rule recognises yet: candidates for new rules in rules.js */
-  const uncl = count(rows.filter(r => r.category === 'Other / unclassified'), r => r.reason.slice(0, 220));
-  if (uncl.length) out.push(el('section', { className: 'card' },
-    el('div', { className: 'card-h' }, el('h2', {}, `Unclassified messages (${uncl.length} distinct)`),
-      el('span', { className: 'muted', style: { fontSize: '12.5px' } }, 'No rule recognises these yet – add rules in rules.js for the frequent ones')),
-    el('table', { className: 'tbl' }, el('thead', {}, el('tr', {}, ['Count', 'Message', 'Suppliers'].map(h => el('th', { textContent: h })))),
-      el('tbody', {}, uncl.slice(0, 25).map(([msg, n]) => el('tr', {}, el('td', { className: 'num', style: { fontWeight: 700 } }, String(n)),
-        el('td', { className: 'mono', style: { fontSize: '12px' } }, msg, copyBtn(msg)),
-        el('td', { className: 'ink2' }, [...new Set(rows.filter(r => r.category === 'Other / unclassified' && r.reason.slice(0, 220) === msg).map(r => r.supplier).filter(Boolean))].join(', ') || '—')))))));
-  /* table */
-  const LIMIT = 300; let limit = LIMIT;
-  const tbody = el('tbody'); const more = el('div', { className: 'card-b' });
-  const fill = () => {
-    tbody.replaceChildren(...rows.slice(0, limit).map(r => el('tr', {},
+  /* Failure messages: with the DB = classified (in FAILURE_MESSAGES or produced by the backend code) vs unclassified
+     (candidates for a new migration); without the DB = no rule in rules.js recognises them. */
+  if (dbOn()) out.push(messagesCard(shown('message')));
+  else {
+    const uncl = count(rows.filter(r => r.category === 'Other / unclassified'), r => r.reason.slice(0, 220));
+    if (uncl.length) out.push(el('section', { className: 'card' },
+      el('div', { className: 'card-h' }, el('h2', {}, `Unclassified messages (${uncl.length} distinct)`),
+        el('span', { className: 'muted', style: { fontSize: '12.5px' } }, 'No rule recognises these yet – add rules in rules.js for the frequent ones')),
+      el('table', { className: 'tbl' }, el('thead', {}, el('tr', {}, ['Count', 'Message', 'Suppliers'].map(h => el('th', { textContent: h })))),
+        el('tbody', {}, uncl.slice(0, 25).map(([msg, n]) => el('tr', {}, el('td', { className: 'num', style: { fontWeight: 700 } }, String(n)),
+          el('td', { className: 'mono', style: { fontSize: '12px' } }, msg, copyBtn(msg)),
+          el('td', { className: 'ink2' }, [...new Set(rows.filter(r => r.category === 'Other / unclassified' && r.reason.slice(0, 220) === msg).map(r => r.supplier).filter(Boolean))].join(', ') || '—')))))));
+  }
+  /* table: paginated, with a ticket column */
+  tPage = 1;
+  const tbody = el('tbody'); const more = el('div');
+  const fill = async () => {
+    const pageRows = pageSlice(rows, tPage, tSize);
+    const tCells = new Map();
+    tbody.replaceChildren(...pageRows.map(r => { const tc = el('td', { style: { whiteSpace: 'nowrap' } }, el('span', { className: 'muted' }, '…')); tCells.set(fKey(r), [tc, r]); return el('tr', {},
       el('td', { className: 'num', style: { whiteSpace: 'nowrap' } }, fmtDate(r.time), r.count > 1 ? el('div', { className: 'muted', style: { fontSize: '12px' } }, `${r.count}× until ${fmtTime(r.last).slice(0, 5)}`) : null),
-      el('td', { className: 'mono' }, r.ref || el('span', { className: 'muted' }, '—'), r.ref ? copyBtn(r.ref) : null),
+      el('td', { className: 'mono' }, r.ref || el('span', { className: 'muted' }, '—'), r.ref ? copyBtn(r.ref) : null,
+        r.pnr ? el('div', { className: 'muted', style: { fontSize: '12px' } }, 'PNR ' + r.pnr) : null,
+        el('div', { className: 'muted', style: { fontSize: '11.5px' }, title: r.cid }, r.cid.slice(0, 14) + '…', copyBtn(r.cid))),
       el('td', {}, el('div', { style: { fontWeight: 600 } }, r.agencyCode || '—'), el('div', { className: 'muted', style: { fontSize: '12.5px' } }, r.agencyName)),
       el('td', { className: 'ink2' }, el('div', { style: { fontWeight: 600 } }, r.supplier || '—'),
         (r.sessionSuppliers || []).filter(x => x !== r.supplier).length ? el('div', { className: 'muted', style: { fontSize: '12px' }, title: 'Other suppliers called in the same session' }, 'session: ' + r.sessionSuppliers.filter(x => x !== r.supplier).join(', ')) : null,
         r.banqueMisr ? el('div', {}, el('span', { className: 'pill', style: { '--c': 'var(--serious)' } }, el('span', { className: 'ico', textContent: '✕' }), 'Banque Misr')) : null),
-      el('td', {}, el('div', { style: { display: 'flex', gap: '6px', alignItems: 'center' } }, el('span', { className: 'swatch', style: { background: colorOf(r.category) } }), el('b', {}, r.category)),
+      el('td', {}, el('div', { style: { display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' } }, el('span', { className: 'swatch', style: { background: colorOf(r.category) } }), el('b', {}, r.category), dbBadge(r)),
+        !isClassified(r) && r.ruleCategory && r.ruleCategory !== r.category ? el('div', { className: 'muted', style: { fontSize: '12px', marginTop: '2px' }, title: 'What rules.js recognises in the message; not in FAILURE_MESSAGES nor in the backend code' }, 'Rule hint: ' + r.ruleCategory) : null,
+        r.db && r.db.friendlyMessage ? el('div', { className: 'muted', style: { fontSize: '12px', marginTop: '2px' } }, 'Shown to agent: ' + r.db.friendlyMessage) : null,
         el('div', { className: 'ink2', style: { fontSize: '13px', marginTop: '2px' } }, r.reason)),
       el('td', { className: 'ink2', style: { fontSize: '12.5px', maxWidth: '280px' } }, r.action),
       el('td', { style: { whiteSpace: 'nowrap' } },
-        r.ref ? el('a', { className: 'linkbtn', href: '/?refs=' + encodeURIComponent(`${r.ref} ${fmtDate(r.time)}`), style: { textDecoration: 'none' } }, 'Case →') : null, ' ',
-        el('a', { className: 'linkbtn', href: '/exceptions?cid=' + encodeURIComponent(r.cid), style: { textDecoration: 'none' } }, 'Explain →')))));
-    more.replaceChildren(rows.length > limit ? el('button', { type: 'button', className: 'iconbtn', onclick: () => { limit += LIMIT; fill(); } }, `Show more (${rows.length - limit} left)`) : el('span', { className: 'muted' }, `${rows.length} row(s)`));
+        el('button', { type: 'button', className: 'iconbtn xp-btn', title: 'Explain the problem and what the supplier answered', onclick: () => explainFailure(r) }, '🔍 Explain'),
+        el('div', { style: { marginTop: '6px' } },
+          r.ref ? el('a', { className: 'linkbtn', href: '/?refs=' + encodeURIComponent(`${r.ref} ${fmtDate(r.time)}`), style: { textDecoration: 'none' } }, 'Case →') : null, ' ',
+          el('a', { className: 'linkbtn', href: '/exceptions?cid=' + encodeURIComponent(r.cid), style: { textDecoration: 'none' }, title: 'Exceptions of this session' }, 'Exceptions →'))), tc); }));
+    more.replaceChildren(rows.length ? paginator({ total: rows.length, page: tPage, size: tSize, onChange: (p, s) => { tPage = p; tSize = s; localStorage.setItem('nb-fail-size', s); fill(); tbody.closest('section')?.scrollIntoView({ behavior: 'smooth' }); } }) : el('div', { className: 'empty' }, 'No rows'));
+    // ticket status for the rows on this page
+    try {
+      const have = await api('/api/crm/lookup', { keys: [...tCells.keys()] });
+      for (const [k, [tc, r]] of tCells) {
+        const t = have[k];
+        if (t) tc.replaceChildren(el('a', { className: 'tk-link', href: '/crm?view=tickets&open=' + t.id, title: 'Open ticket' }, t.id), ' ', statusPill(t.status));
+        else { const b = el('button', { type: 'button', className: 'iconbtn tk-btn', title: 'Track this failure as a CRM ticket' }, '＋ Ticket');
+          b.onclick = async () => { b.disabled = true; try { const t2 = await createTicket({ ...r, failureKey: k, failureTime: r.time }); tc.replaceChildren(el('a', { className: 'tk-link', href: '/crm?view=tickets&open=' + t2.id }, t2.id), ' ', statusPill(t2.status)); } catch (e) { toast('⚠ ' + e.message); b.disabled = false; } };
+          tc.replaceChildren(b); }
+      }
+    } catch { for (const [, [tc]] of tCells) tc.replaceChildren(el('span', { className: 'muted' }, '—')); }
   };
   fill();
-  out.push(el('section', { className: 'card' },
-    el('div', { className: 'card-h' }, el('h2', {}, 'Failed bookings'), el('span', { className: 'muted' }, `${rows.length} of ${all.length}`)),
-    el('table', { className: 'tbl' }, el('thead', {}, el('tr', {}, ['Time', 'Booking ref', 'Agency', 'Supplier', 'Reason', 'What to do', ''].map(h => el('th', { textContent: h })))), tbody), more));
+  const bulkBtn = el('button', { type: 'button', className: 'iconbtn', title: 'Create tickets for every row shown (filters applied); already tracked ones are skipped' }, `＋ Tickets for all ${rows.length} shown`);
+  bulkBtn.onclick = async () => {
+    if (!confirm(`Create CRM tickets for ${rows.length} failed booking(s)? Already tracked ones are skipped.`)) return;
+    bulkBtn.disabled = true;
+    try { const r = await api('/api/crm/import', { from: data.from, to: data.to, agency: data.agency, supplier: data.supplier, pnr: data.focus && data.focus.pnr, cid: data.focus && data.focus.cid, keys: rows.map(fKey) });
+      toast(`${r.created} ticket(s) created, ${r.skipped} already tracked`); fill(); } catch (e) { toast('⚠ ' + e.message); }
+    finally { bulkBtn.disabled = false; }
+  };
+  const fm = filt.message && filt.message.split('\u0001');
+  out.push(el('section', { className: 'card', id: 'failTable' },
+    fm ? el('div', { className: 'notice msg-focus' },
+      el('div', {}, el('b', {}, `${rows.length} failed booking${rows.length === 1 ? '' : 's'} with this message`), el('span', { className: 'muted' }, ` · ${fm[0]}`)),
+      el('div', { className: 'mono', style: { fontSize: '12px', margin: '4px 0 8px' } }, fm[1]),
+      el('button', { type: 'button', className: 'iconbtn', onclick: () => { filt.message = null; render(); } }, '✕ Show all failed bookings')) : null,
+    el('div', { className: 'card-h' }, el('h2', {}, 'Failed bookings'), el('span', { className: 'muted' }, `${rows.length} of ${all.length}`), el('div', { style: { flex: 1 } }), rows.length ? bulkBtn : null),
+    el('table', { className: 'tbl' }, el('thead', {}, el('tr', {}, ['Time', 'Booking ref', 'Agency', 'Supplier', 'Reason', 'What to do', '', 'Ticket'].map(h => el('th', { textContent: h })))), tbody), more));
   $('#out').replaceChildren(...out);
 }
 
@@ -193,11 +420,13 @@ function chart(rows, topCats, colorOf) {
 /* exports */
 const COLS = [{ key: 'time', label: 'Time', time: true, width: '11%' }, { key: 'ref', label: 'Booking ref', mono: true, width: '14%' }, { key: 'agency', label: 'Agency', width: '13%' },
   { key: 'supplier', label: 'Supplier', width: '9%' }, { key: 'category', label: 'Reason', width: '15%' }, { key: 'reason', label: 'Message' }, { key: 'action', label: 'What to do', width: '20%' }];
-const flat = (r) => ({ ...r, agency: [r.agencyCode, r.agencyName].filter(Boolean).join(' · '), supplier: r.supplier + (r.banqueMisr ? ' (Banque Misr)' : '') });
+const flat = (r) => ({ ...r, ref: [r.ref, r.pnr && 'PNR ' + r.pnr].filter(Boolean).join(' · '), agency: [r.agencyCode, r.agencyName].filter(Boolean).join(' · '), supplier: r.supplier + (r.banqueMisr ? ' (Banque Misr)' : '') });
 function exportCsv() {
   const q = (v) => '"' + String(v ?? '').replace(/"/g, '""') + '"';
-  const head = ['time_local', 'last_local', 'count', 'booking_ref', 'agency_code', 'agency_name', 'supplier', 'banque_misr', 'reason_category', 'message', 'what_to_do', 'sources', 'correlation_id', 'server'];
-  const lines = [head.join(','), ...shown().map(r => [fmtDate(r.time), fmtDate(r.last), r.count, r.ref, r.agencyCode, r.agencyName, r.supplier, r.banqueMisr ? 'yes' : '', r.category, r.reason, r.action, r.sources.join(' '), r.cid, r.host].map(q).join(','))];
+  const head = ['time_local', 'last_local', 'count', 'booking_ref', 'pnr', 'agency_code', 'agency_name', 'supplier', 'banque_misr', 'reason_category', 'rule_hint', 'message', 'what_to_do',
+    'db_classified', 'db_failure_message_id', 'db_category', 'db_friendly_message', 'backend_code', 'sources', 'correlation_id', 'server'];
+  const lines = [head.join(','), ...shown().map(r => [fmtDate(r.time), fmtDate(r.last), r.count, r.ref, r.pnr, r.agencyCode, r.agencyName, r.supplier, r.banqueMisr ? 'yes' : '', r.category, r.ruleCategory && r.ruleCategory !== r.category ? r.ruleCategory : '', r.reason, r.action,
+    dbOn() ? (r.db ? 'yes' : 'no') : '', r.db ? r.db.id : '', r.db ? r.db.category : '', r.db ? r.db.friendlyMessage : '', r.backend ? r.backend.path + ':' + r.backend.line : '', r.sources.join(' '), r.cid, r.host].map(q).join(','))];
   const a = el('a', { href: URL.createObjectURL(new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv' })), download: `booking-failures-${new Date().toISOString().slice(0, 16).replace('T', '_').replace(':', '')}.csv` });
   a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 5000);
 }
@@ -231,6 +460,7 @@ if (QS.get('theme')) setTheme(QS.get('theme'));
 if (QS.get('from')) { $('[name=from]').value = toLocal(new Date(QS.get('from'))); $('[name=to]').value = toLocal(new Date(QS.get('to') || Date.now()));
   document.querySelectorAll('#presets button').forEach(b => b.setAttribute('aria-pressed', 'false')); } else preset(24);
 $('[name=agency]').value = QS.get('agency') || ''; $('[name=supplier]').value = QS.get('supplier') || '';
+$('[name=pnr]').value = QS.get('pnr') || ''; $('[name=cid]').value = QS.get('cid') || '';
 load();
 </script>
 </body>

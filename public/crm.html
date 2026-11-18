@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NDC Care · CRM</title>
+<script>document.documentElement.dataset.theme = localStorage.getItem('nb-theme') || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');</script>
+<link rel="stylesheet" href="/app.css">
+<link rel="stylesheet" href="/crm.css">
+</head>
+<body>
+<header class="bar">
+  <div class="brand"><div class="logo">NB</div>NDC Care</div>
+  <h1 id="pageTitle" style="margin:0;font-size:16px;font-weight:650">Overview</h1>
+  <div class="sp"></div>
+  <button class="iconbtn" type="button" id="btnImport">⤓ Import failures</button>
+  <button class="primary" type="button" id="btnNew" style="height:32px">＋ New ticket</button>
+  <button class="iconbtn" id="themeBtn" title="Toggle light / dark"></button>
+</header>
+
+<main id="main"></main>
+
+<div class="scrim" id="scrim"></div>
+<aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-label="Ticket">
+  <div class="dh" id="dh"></div>
+  <div class="db" id="db"></div>
+</aside>
+<div class="tip" id="tip"></div>
+<div class="toast" id="toast"></div>
+
+<script src="/common.js"></script>
+<script src="/crm-ui.js"></script>
+<script>
+const QS = new URLSearchParams(location.search);
+if (QS.get('theme')) setTheme(QS.get('theme'));
+const VIEW = QS.get('view') === 'tickets' ? 'tickets' : 'overview';
+const STATUSES = Object.keys(T_STATUS), PRIORITIES = ['urgent', 'high', 'normal', 'low'];
+const ago = (iso) => { if (!iso) return ''; const m = (Date.now() - Date.parse(iso)) / 60000; return m < 1 ? 'just now' : m < 60 ? `${Math.round(m)} min ago` : m < 2880 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} d ago`; };
+const toLocalInput = (iso) => iso ? new Date(Date.parse(iso) - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 16) : '';
+
+/* ================= Overview ================= */
+async function overview() {
+  $('#pageTitle').textContent = 'Overview';
+  const s = await api('/api/crm/stats');
+  const tile = (label, v, color, href, sub) => el('a', { className: 'tile', href, style: { textDecoration: 'none', color: 'inherit', ...(color ? { '--c': color } : {}) } },
+    el('div', { className: 'lab' }, label), el('div', { className: 'val num', textContent: v.toLocaleString() }), sub ? el('div', { className: 'muted', style: { fontSize: '12px' } }, sub) : null);
+  const bars = (obj, href) => { const items = Object.entries(obj).sort((a, b) => b[1] - a[1]).slice(0, 8); const max = Math.max(1, ...items.map((i) => i[1]));
+    return items.length ? el('div', { className: 'barlist' }, items.map(([k, n]) => el('a', { className: 'bl-row click', href: href(k), style: { textDecoration: 'none', color: 'inherit' } },
+      el('div', { className: 'bl-lab', style: { fontFamily: 'inherit' }, title: k }, k), el('div', { className: 'bl-track' }, el('div', { className: 'bl-bar', style: { width: (n / max * 100) + '%' } })),
+      el('div', { className: 'bl-val num', textContent: n })))) : el('div', { className: 'muted' }, 'No open tickets'); };
+  const total = Math.max(1, s.total);
+  const empty = !s.total;
+  $('#main').replaceChildren(...[
+    empty ? el('section', { className: 'card' }, el('div', { className: 'empty' }, el('div', { className: 'big' }, 'No tickets yet'),
+      el('div', {}, 'Import failed bookings from the logs, or create a ticket from a booking ref / PNR.'),
+      el('div', { style: { marginTop: '12px', display: 'flex', gap: '8px', justifyContent: 'center' } },
+        el('button', { className: 'primary', type: 'button', onclick: importDialog, style: { height: '34px' } }, '⤓ Import failures'),
+        el('button', { className: 'iconbtn', type: 'button', onclick: () => newTicketDialog() }, '＋ New ticket')))) : null,
+    el('section', { className: 'card card-b' },
+      el('div', { className: 'tiles' },
+        tile('Open tickets', s.open, 'var(--accent)', '/crm?view=tickets&tv=open'),
+        tile('Urgent / high open', s.urgentOpen, 'var(--critical)', '/crm?view=tickets&tv=urgent'),
+        tile('Overdue follow-ups', s.overdue, s.overdue ? 'var(--critical)' : null, '/crm?view=tickets&tv=overdue'),
+        tile('New today', s.newToday, null, '/crm?view=tickets&tv=today'),
+        tile('Resolved / closed (7 days)', s.resolvedWeek, 'var(--good)', '/crm?view=tickets&status=resolved,closed'),
+        tile('All tickets', s.total, null, '/crm?view=tickets')),
+      el('div', { style: { marginTop: '16px' } }, el('div', { className: 'muted', style: { fontSize: '12.5px' } }, 'Pipeline by status'),
+        el('div', { className: 'pipeline' }, STATUSES.filter((k) => s.byStatus[k]).map((k) => { const d = el('div', { style: { flex: s.byStatus[k], background: T_STATUS[k].c } });
+          hoverTip(d, () => [el('b', {}, T_STATUS[k].label), el('div', {}, `${s.byStatus[k]} ticket(s) · ${Math.round(s.byStatus[k] / total * 100)}%`)]); return d; })),
+        el('div', { className: 'legend', style: { marginTop: '8px' } }, STATUSES.map((k) => el('a', { className: 'lg', href: '/crm?view=tickets&status=' + k, style: { textDecoration: 'none', color: 'inherit' } },
+          el('span', { className: 'swatch', style: { background: T_STATUS[k].c } }), `${T_STATUS[k].label}  `, el('b', { className: 'num' }, String(s.byStatus[k] || 0))))))),
+    el('div', { className: 'grid3' },
+      el('section', { className: 'card' }, el('div', { className: 'card-h' }, el('h2', {}, 'Open by reason')), el('div', { className: 'card-b' }, bars(s.byCategoryOpen, (k) => '/crm?view=tickets&tv=open&category=' + encodeURIComponent(k)))),
+      el('section', { className: 'card' }, el('div', { className: 'card-h' }, el('h2', {}, 'Open by agency')), el('div', { className: 'card-b' }, bars(s.byAgencyOpen, (k) => '/crm?view=tickets&tv=open&agency=' + encodeURIComponent(k)))),
+      el('section', { className: 'card' }, el('div', { className: 'card-h' }, el('h2', {}, 'Open by supplier')), el('div', { className: 'card-b' }, bars(s.bySupplierOpen, (k) => '/crm?view=tickets&tv=open&supplier=' + encodeURIComponent(k))))),
+    el('div', { className: 'grid2' },
+      el('section', { className: 'card' }, el('div', { className: 'card-h' }, el('h2', {}, 'Follow-ups')),
+        el('div', { className: 'card-b mini-list' }, s.dueSoon.length ? s.dueSoon.map((t) => el('a', { href: '/crm?view=tickets&open=' + t.id },
+          el('span', { className: 'tk-link', textContent: t.id }), el('span', { style: { flex: 1 } }, t.title), prioPill(t.priority),
+          el('span', { className: 'num ' + (t.overdue ? 'due-overdue' : 'muted') }, (t.overdue ? 'overdue · ' : '') + fmtDate(t.dueAt)))) : el('div', { className: 'muted' }, 'No follow-up dates set'))),
+      el('section', { className: 'card' }, el('div', { className: 'card-h' }, el('h2', {}, 'Recently updated')),
+        el('div', { className: 'card-b mini-list' }, s.recent.length ? s.recent.map((t) => el('a', { href: '/crm?view=tickets&open=' + t.id },
+          el('span', { className: 'tk-link', textContent: t.id }), el('span', { style: { flex: 1 } }, t.title), statusPill(t.status), el('span', { className: 'muted', style: { fontSize: '12px' } }, ago(t.updatedAt)))) : el('div', { className: 'muted' }, 'Nothing yet'))))].filter(Boolean));
+}
+
+/* ================= Tickets list (server-side pagination) ================= */
+const LS = JSON.parse(localStorage.getItem('nb-crm-list') || '{}');
+const st = { page: +QS.get('page') || 1, size: LS.size || 25, sort: LS.sort || 'updatedAt', dir: LS.dir || 'desc',
+  tv: QS.get('tv') || (QS.get('status') || QS.get('q') || QS.get('agency') || QS.get('supplier') || QS.get('category') ? '' : 'open'),
+  status: QS.get('status') || '', priority: QS.get('priority') || '', q: QS.get('q') || '', agency: QS.get('agency') || '', supplier: QS.get('supplier') || '', category: QS.get('category') || '' };
+const selected = new Set();
+let lastList = null;
+
+function syncUrl() {
+  const p = new URLSearchParams({ view: 'tickets' });
+  for (const k of ['tv', 'status', 'priority', 'q', 'agency', 'supplier', 'category']) if (st[k]) p.set(k, st[k]);
+  if (st.page > 1) p.set('page', st.page);
+  history.replaceState(null, '', '/crm?' + p);
+  localStorage.setItem('nb-crm-list', JSON.stringify({ size: st.size, sort: st.sort, dir: st.dir }));
+}
+
+async function tickets() {
+  $('#pageTitle').textContent = 'Tickets';
+  const p = new URLSearchParams({ page: st.page, size: st.size, sort: st.sort, dir: st.dir });
+  if (st.tv) p.set('view', st.tv);
+  for (const k of ['status', 'priority', 'q', 'agency', 'supplier', 'category']) if (st[k]) p.set(k, st[k]);
+  const [list, s] = await Promise.all([api('/api/crm/tickets?' + p), api('/api/crm/stats')]);
+  lastList = list; syncUrl();
+  if (list.page > list.pages && list.total) { st.page = list.pages; return tickets(); }
+
+  const views = [['open', 'Open', s.open], ['urgent', 'Urgent / high', s.urgentOpen], ['overdue', 'Overdue', s.overdue], ['today', 'New today', s.newToday], ['', 'All', s.total]];
+  const tabs = el('div', { className: 'status-tabs' },
+    ...views.map(([v, l, n]) => { const b = el('button', { type: 'button', className: 'stab', 'aria-pressed': String(st.tv === v && !st.status) }, l, el('b', {}, String(n || 0)));
+      b.onclick = () => { st.tv = v; st.status = ''; st.page = 1; tickets(); }; return b; }),
+    el('span', { className: 'muted', style: { margin: '0 4px' } }, '|'),
+    ...STATUSES.map((k) => { const b = el('button', { type: 'button', className: 'stab', 'aria-pressed': String(st.status === k) }, el('span', { className: 'swatch', style: { background: T_STATUS[k].c } }), T_STATUS[k].label, el('b', {}, String(s.byStatus[k] || 0)));
+      b.onclick = () => { st.status = st.status === k ? '' : k; st.tv = ''; st.page = 1; tickets(); }; return b; }));
+
+  const search = el('input', { type: 'search', placeholder: 'Search id, ref, PNR, agency, reason, tag…', value: st.q });
+  let t; search.oninput = () => { clearTimeout(t); t = setTimeout(() => { st.q = search.value.trim(); st.page = 1; tickets(); }, 350); };
+  const pr = el('select', { className: 'crm-select', 'aria-label': 'Priority' }, el('option', { value: '', textContent: 'Any priority' }), PRIORITIES.map((x) => el('option', { value: x, textContent: T_PRIO[x].label, selected: st.priority === x })));
+  pr.onchange = () => { st.priority = pr.value; st.page = 1; tickets(); };
+  const chips = ['agency', 'supplier', 'category'].filter((k) => st[k]).map((k) => { const c = el('button', { type: 'button', className: 'chip', title: 'Remove filter' }, `${k}: ${st[k]} ✕`); c.onclick = () => { st[k] = ''; st.page = 1; tickets(); }; return c; });
+
+  // bulk bar
+  const ids = list.items.map((x) => x.id);
+  const bulkStatus = el('select', { className: 'crm-select' }, el('option', { value: '', textContent: 'Set status…' }), STATUSES.map((k) => el('option', { value: k, textContent: T_STATUS[k].label })));
+  const bulkPrio = el('select', { className: 'crm-select' }, el('option', { value: '', textContent: 'Set priority…' }), PRIORITIES.map((k) => el('option', { value: k, textContent: T_PRIO[k].label })));
+  const doBulk = async (set) => { await api('/api/crm/bulk', { ids: [...selected], set }); toast(`${selected.size} ticket(s) updated`); selected.clear(); tickets(); };
+  bulkStatus.onchange = () => bulkStatus.value && doBulk({ status: bulkStatus.value });
+  bulkPrio.onchange = () => bulkPrio.value && doBulk({ priority: bulkPrio.value });
+  const bulkbar = selected.size ? el('div', { className: 'bulkbar' }, el('b', {}, `${selected.size} selected`), bulkStatus, bulkPrio,
+    el('button', { type: 'button', className: 'iconbtn', onclick: () => { selected.clear(); tickets(); } }, 'Clear selection')) : null;
+
+  const sortTh = (key, label, style) => { const th = el('th', { className: 'th-sort', style: style || {} }, label, st.sort === key ? (st.dir === 'asc' ? ' ▲' : ' ▼') : '');
+    th.onclick = () => { if (st.sort === key) st.dir = st.dir === 'asc' ? 'desc' : 'asc'; else { st.sort = key; st.dir = key === 'priority' || key === 'updatedAt' || key === 'failureTime' ? 'desc' : 'asc'; } st.page = 1; tickets(); }; return th; };
+  const all = el('input', { type: 'checkbox', 'aria-label': 'Select page', checked: ids.length > 0 && ids.every((i) => selected.has(i)) });
+  all.onchange = () => { ids.forEach((i) => (all.checked ? selected.add(i) : selected.delete(i))); tickets(); };
+  const rows = list.items.map((x) => { const cb = el('input', { type: 'checkbox', checked: selected.has(x.id), 'aria-label': 'Select ' + x.id });
+    cb.onclick = (e) => { e.stopPropagation(); cb.checked ? selected.add(x.id) : selected.delete(x.id); tickets(); };
+    const tr = el('tr', { className: 'tk' + (x.overdue ? ' overdue' : ''), tabIndex: 0 },
+      el('td', {}, cb),
+      el('td', { style: { whiteSpace: 'nowrap' } }, el('div', { className: 'tk-link', textContent: x.id }), el('div', { className: 'tk-sub', textContent: ago(x.updatedAt) })),
+      el('td', {}, el('div', { className: 'tk-title', textContent: x.title }), el('div', { className: 'tk-sub' }, [x.ref, x.pnr && 'PNR ' + x.pnr].filter(Boolean).join(' · ') || '—'),
+        x.tags.length ? el('div', { className: 'chips', style: { marginTop: '4px' } }, x.tags.map((g) => el('span', { className: 'chip', textContent: g }))) : null),
+      el('td', {}, statusPill(x.status)), el('td', {}, prioPill(x.priority)),
+      el('td', {}, el('div', { style: { fontWeight: 600 } }, x.agencyCode || '—'), el('div', { className: 'tk-sub', textContent: x.agencyName })),
+      el('td', { className: 'ink2' }, x.supplier || '—'),
+      el('td', { className: 'num' + (x.overdue ? ' due-overdue' : ''), style: { whiteSpace: 'nowrap' } }, x.dueAt ? fmtDate(x.dueAt) : el('span', { className: 'muted' }, '—')),
+      el('td', { className: 'num muted', style: { whiteSpace: 'nowrap' } }, x.failureTime ? fmtDate(x.failureTime) : fmtDate(x.createdAt)),
+      el('td', { className: 'num muted', style: { textAlign: 'right' } }, x.notesCount ? '💬 ' + x.notesCount : ''));
+    tr.onclick = () => openTicket(x.id); tr.onkeydown = (e) => { if (e.key === 'Enter') openTicket(x.id); };
+    return tr; });
+
+  $('#main').replaceChildren(el('section', { className: 'card' },
+    el('div', { className: 'toolbar' }, tabs),
+    el('div', { className: 'toolbar' }, search, pr, ...chips, el('div', { style: { flex: 1 } }), el('span', { className: 'muted', style: { fontSize: '12.5px' } }, `${list.total.toLocaleString()} ticket(s)`)),
+    bulkbar,
+    list.total ? el('table', { className: 'tbl' },
+      el('thead', {}, el('tr', {}, el('th', { style: { width: '28px' } }, all), sortTh('id', 'Ticket'), sortTh('title', 'Booking / reason'), sortTh('status', 'Status'), sortTh('priority', 'Priority'),
+        sortTh('agencyCode', 'Agency'), sortTh('supplier', 'Supplier'), sortTh('dueAt', 'Follow-up'), sortTh('failureTime', 'Failed at'), el('th', {}, ''))),
+      el('tbody', {}, rows))
+      : el('div', { className: 'empty' }, el('div', { className: 'big' }, 'No tickets match'), 'Change the view or filters, or import failed bookings.'),
+    list.total ? paginator({ total: list.total, page: list.page, size: list.size, onChange: (pg, sz) => { st.page = pg; st.size = sz; tickets(); } }) : null));
+}
+
+/* ================= Ticket drawer ================= */
+// History labels and values in readable form.
+const HF = { status: 'Status', priority: 'Priority', dueAt: 'Follow-up', tags: 'Tags', resolution: 'Resolution', owner: 'Owner', title: 'Title' };
+const hv = (field, v) => v == null || v === '' || (Array.isArray(v) && !v.length) ? '—'
+  : field === 'dueAt' ? fmtDate(v) : field === 'status' ? (T_STATUS[v] || {}).label || v : field === 'priority' ? (T_PRIO[v] || {}).label || v
+  : Array.isArray(v) ? v.join(', ') : String(v).length > 80 ? String(v).slice(0, 80) + '…' : String(v);
+const openD = () => { $('#drawer').classList.add('open'); $('#scrim').classList.add('open'); };
+function closeDrawer() { $('#drawer').classList.remove('open'); $('#scrim').classList.remove('open'); const p = new URLSearchParams(location.search); if (p.has('open')) { p.delete('open'); history.replaceState(null, '', '/crm?' + p); } }
+$('#scrim').onclick = closeDrawer;
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDrawer(); });
+
+async function openTicket(id) {
+  const t = await api('/api/crm/tickets/' + encodeURIComponent(id));
+  const p = new URLSearchParams(location.search); p.set('open', id); history.replaceState(null, '', '/crm?' + p);
+  const save = async (patch) => { try { await api('/api/crm/tickets/' + id, patch, 'PATCH'); toast('Saved'); await openTicket(id); if (VIEW === 'tickets') tickets(); } catch (e) { toast('⚠ ' + e.message); } };
+  const sel = (opts, cur, field, meta) => { const s = el('select', { className: 'crm-select' }, opts.map((k) => el('option', { value: k, textContent: meta[k].label, selected: k === cur })));
+    s.onchange = () => save({ [field]: s.value }); return s; };
+  const due = el('input', { type: 'datetime-local', value: toLocalInput(t.dueAt) }); due.onchange = () => save({ dueAt: due.value ? new Date(due.value).toISOString() : null });
+  const tags = el('input', { type: 'text', value: t.tags.join(', '), placeholder: 'tag1, tag2' }); tags.onchange = () => save({ tags: tags.value });
+  const res = el('textarea', { rows: 2, value: t.resolution || '', placeholder: 'How it was resolved (shown when closed)' }); res.onchange = () => save({ resolution: res.value });
+  const noteTxt = el('textarea', { rows: 3, placeholder: 'Add a note: what you checked, who you contacted, next step…' });
+  const addNote = el('button', { type: 'button', className: 'primary', style: { height: '32px' } }, 'Add note');
+  addNote.onclick = async () => { if (!noteTxt.value.trim()) return; await api('/api/crm/tickets/' + id + '/notes', { text: noteTxt.value }); toast('Note added'); openTicket(id); };
+  const quick = (label, patch) => el('button', { type: 'button', className: 'iconbtn', onclick: () => save(patch) }, label);
+  const caseHref = t.ref ? '/?refs=' + encodeURIComponent(t.failureTime ? `${t.ref} ${fmtDate(t.failureTime)}` : t.ref) : null;
+
+  $('#dh').replaceChildren(
+    el('div', { className: 'dh-top' }, el('span', { className: 'tk-link', style: { fontSize: '14px' } }, t.id), el('h3', {}, t.title), el('div', { style: { flex: 1 } }),
+      el('button', { className: 'iconbtn', type: 'button', onclick: closeDrawer, title: 'Close (Esc)' }, '✕')),
+    el('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, statusPill(t.status), prioPill(t.priority),
+      t.banqueMisr ? el('span', { className: 'pill', style: { '--c': 'var(--serious)' } }, el('span', { className: 'ico', textContent: '✕' }), 'Banque Misr – not booked') : null,
+      el('span', { className: 'muted', style: { fontSize: '12.5px' } }, `created ${fmtDate(t.createdAt)} · updated ${ago(t.updatedAt)}`)),
+    el('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } },
+      t.status === 'new' ? quick('▶ Start investigating', { status: 'investigating' }) : null,
+      quick('⏳ Waiting supplier', { status: 'waiting-supplier' }), quick('⏳ Waiting agency', { status: 'waiting-agency' }),
+      quick('✓ Resolve', { status: 'resolved' }), quick('Close', { status: 'closed' }),
+      caseHref ? el('a', { className: 'iconbtn', href: caseHref, style: { textDecoration: 'none' } }, '⌕ Case') : null,
+      t.pnr ? el('a', { className: 'iconbtn', href: '/failures?pnr=' + encodeURIComponent(t.pnr), style: { textDecoration: 'none' } }, '✕ Failures (PNR)') : null,
+      t.cid ? el('a', { className: 'iconbtn', href: '/exceptions?cid=' + encodeURIComponent(t.cid), style: { textDecoration: 'none' } }, '⚡ Explain') : null,
+      t.cid ? el('a', { className: 'iconbtn', href: osdLink(t.cid), target: '_blank', rel: 'noopener', style: { textDecoration: 'none' } }, 'OpenSearch ↗') : null));
+
+  $('#db').replaceChildren(
+    el('section', { className: 'card card-b' }, el('div', { className: 'form-grid' },
+      el('label', { className: 'field' }, el('span', {}, 'Status'), sel(STATUSES, t.status, 'status', T_STATUS)),
+      el('label', { className: 'field' }, el('span', {}, 'Priority'), sel(PRIORITIES, t.priority, 'priority', T_PRIO)),
+      el('label', { className: 'field' }, el('span', {}, 'Follow-up'), due),
+      el('label', { className: 'field' }, el('span', {}, 'Tags'), tags)),
+      !['new', 'investigating', 'waiting-supplier', 'waiting-agency'].includes(t.status) ? el('label', { className: 'field', style: { marginTop: '10px' } }, el('span', {}, 'Resolution'), res) : null),
+    el('section', { className: 'card card-b' }, el('dl', { className: 'kv2' },
+      ...[['Booking ref', t.ref], ['PNR', t.pnr], ['Agency', [t.agencyCode, t.agencyName].filter(Boolean).join(' · ')], ['Supplier', t.supplier],
+        ['Failed at', t.failureTime && fmtDate(t.failureTime)], ['Reason', t.category], ['Message', t.reason], ['What to do', t.action], ['Session', t.cid], ['Source', t.source === 'import' ? 'imported from booking failures' : 'created manually']]
+        .filter(([, v]) => v).flatMap(([k, v]) => [el('dt', { textContent: k }), el('dd', {}, v, ['Booking ref', 'PNR', 'Session'].includes(k) ? copyBtn(v) : null)]))),
+    el('section', { className: 'card card-b', style: { display: 'grid', gap: '8px' } }, el('b', {}, `Notes (${t.notes.length})`),
+      ...t.notes.slice().reverse().map((n) => el('div', { className: 'note' }, el('span', { className: 'muted' }, fmtDate(n.at)), n.text)),
+      noteTxt, el('div', {}, addNote)),
+    el('section', { className: 'card card-b' }, el('b', {}, 'History'), el('div', { className: 'hist', style: { marginTop: '6px' } },
+      t.history.slice().reverse().map((h) => el('div', {}, el('span', { className: 'muted num' }, fmtDate(h.at)),
+        el('span', {}, h.field ? `${HF[h.field] || h.field}: ${hv(h.field, h.from)} → ${hv(h.field, h.to)}` : h.action))))),
+    el('div', {}, el('button', { type: 'button', className: 'linkbtn', style: { color: 'var(--critical-text)' }, onclick: async () => {
+      if (!confirm(`Delete ${t.id}? This cannot be undone (a daily backup exists in data/backups).`)) return;
+      await api('/api/crm/tickets/' + id, {}, 'DELETE'); toast('Ticket deleted'); closeDrawer(); route(); } }, 'Delete ticket')));
+  openD();
+}
+
+/* ================= New ticket / import ================= */
+function modal(title, body) {
+  const wrap = el('div', { className: 'modal-wrap', onclick: (e) => { if (e.target === wrap) wrap.remove(); } },
+    el('div', { className: 'modal', role: 'dialog', 'aria-modal': 'true' }, el('div', { className: 'modal-h' }, el('b', {}, title), el('div', { style: { flex: 1 } }),
+      el('button', { type: 'button', className: 'iconbtn', onclick: () => wrap.remove() }, '✕')), el('div', { className: 'modal-b' }, body)));
+  document.body.append(wrap); return wrap;
+}
+function newTicketDialog(prefill = {}) {
+  const f = { ref: el('input', { type: 'text', value: prefill.ref || '', placeholder: 'NDCEG-BR-…', className: 'mono' }), pnr: el('input', { type: 'text', value: prefill.pnr || '', placeholder: 'ABC123', className: 'mono' }),
+    cid: el('input', { type: 'text', value: prefill.cid || '', placeholder: 'session id (optional)', className: 'mono' }), agencyCode: el('input', { type: 'text', placeholder: 'AGN…' }),
+    title: el('input', { type: 'text', placeholder: 'Short title (optional)' }), note: el('textarea', { rows: 3, placeholder: 'What happened / what the agency reported' }) };
+  const prio = el('select', { className: 'crm-select' }, PRIORITIES.map((k) => el('option', { value: k, textContent: T_PRIO[k].label, selected: k === 'normal' })));
+  const go = el('button', { type: 'button', className: 'primary', style: { height: '34px' } }, 'Create ticket');
+  let w;
+  go.onclick = async () => { try { const r = await api('/api/crm/tickets', { ref: f.ref.value, pnr: f.pnr.value, cid: f.cid.value, agencyCode: f.agencyCode.value, title: f.title.value || undefined, note: f.note.value, priority: prio.value });
+    w.remove(); toast(`Ticket ${r.ticket.id} created`); route(); openTicket(r.ticket.id); } catch (e) { toast('⚠ ' + e.message); } };
+  w = modal('＋ New ticket', [el('div', { className: 'form-grid' }, ...[['Booking ref', f.ref], ['PNR', f.pnr], ['Agency code', f.agencyCode], ['Priority', prio]].map(([l, i]) => el('label', { className: 'field' }, el('span', {}, l), i))),
+    el('label', { className: 'field' }, el('span', {}, 'Correlation id'), f.cid), el('label', { className: 'field' }, el('span', {}, 'Title'), f.title),
+    el('label', { className: 'field' }, el('span', {}, 'First note'), f.note), el('div', { className: 'muted', style: { fontSize: '12px' } }, 'At least one of booking ref, PNR or correlation id.'), el('div', {}, go)]);
+  f.ref.focus();
+}
+function importDialog() {
+  const toL = (d) => new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+  const from = el('input', { type: 'datetime-local', value: toL(new Date(Date.now() - 24 * 3600e3)) }), to = el('input', { type: 'datetime-local', value: toL(new Date()) });
+  const agency = el('input', { type: 'text', placeholder: 'optional' }), supplier = el('input', { type: 'text', placeholder: 'optional' }), pnr = el('input', { type: 'text', placeholder: 'optional', className: 'mono' });
+  const info = el('div', { className: 'muted' }, 'Click Preview to see how many tickets would be created.');
+  const body = () => ({ from: new Date(from.value).toISOString(), to: new Date(to.value).toISOString(), agency: agency.value.trim(), supplier: supplier.value.trim(), pnr: pnr.value.trim() });
+  const preview = el('button', { type: 'button', className: 'iconbtn' }, 'Preview');
+  const run = el('button', { type: 'button', className: 'primary', style: { height: '34px' }, disabled: true }, 'Import');
+  preview.onclick = async () => { info.textContent = 'Checking the logs…'; try { const r = await api('/api/crm/import', { ...body(), dryRun: true });
+    info.textContent = `${r.total} failed booking(s) in this range: ${r.wouldCreate} new ticket(s) would be created, ${r.alreadyTracked} already tracked.`; run.disabled = !r.wouldCreate; } catch (e) { info.textContent = '⚠ ' + e.message; } };
+  let w;
+  run.onclick = async () => { run.disabled = true; info.textContent = 'Importing…'; try { const r = await api('/api/crm/import', body()); w.remove(); toast(`${r.created} ticket(s) created, ${r.skipped} already tracked`); route(); } catch (e) { info.textContent = '⚠ ' + e.message; run.disabled = false; } };
+  w = modal('⤓ Import failed bookings as tickets', [
+    el('div', { className: 'form-grid' }, ...[['From', from], ['To', to], ['Agency', agency], ['Supplier', supplier], ['PNR', pnr]].map(([l, i]) => el('label', { className: 'field' }, el('span', {}, l), i))),
+    el('div', { className: 'muted', style: { fontSize: '12px' } }, 'Same data as the Booking failures page. Failures already tracked are skipped, so importing twice is safe. Priority is suggested from the reason (e.g. Banque Misr / ticketing errors = high).'),
+    info, el('div', { style: { display: 'flex', gap: '8px' } }, preview, run)]);
+}
+$('#btnNew').onclick = () => newTicketDialog();
+$('#btnImport').onclick = importDialog;
+
+/* ================= init ================= */
+async function route() {
+  try { if (VIEW === 'tickets') await tickets(); else await overview(); }
+  catch (e) { $('#main').replaceChildren(el('section', { className: 'card' }, el('div', { className: 'empty err' }, '⚠ ' + e.message))); }
+}
+route().then(() => { if (QS.get('open')) openTicket(QS.get('open')).catch((e) => toast('⚠ ' + e.message)); });
+if (QS.get('new')) newTicketDialog({ ref: QS.get('ref') || '', pnr: QS.get('pnr') || '', cid: QS.get('cid') || '' });
+</script>
+</body>
+</html>

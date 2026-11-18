@@ -58,8 +58,8 @@ const phaseOf = (e) => { const m = e.method || '', c = e.context || {}, a = c.ac
   return 'other'; };
 const PHN = Object.fromEntries([...PH, ['other', 'Other']]);
 
-async function api(url, body) {
-  const r = await fetch(url, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : undefined);
+async function api(url, body, method) {
+  const r = await fetch(url, body ? { method: method || 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : undefined);
   const j = await r.json(); if (!r.ok) throw new Error(j.error || r.status); return j; }
 
 const pretty = (s) => { try { return JSON.stringify(JSON.parse(s), null, 2); } catch { return s; } };
@@ -115,4 +115,143 @@ function sendToTeamLeader(opts) {
     el('div', { className: 'muted', style: { fontSize: '12px' } }, `Posts to ${az.org}/${az.project}. Nothing is sent until you click Send.`),
     el('div', { style: { display: 'flex', gap: '8px' } }, send, el('button', { type: 'button', className: 'iconbtn', onclick: close }, 'Cancel')), res);
   wi.focus();
+}
+
+/* loading: a thin top progress bar for every api() call, and a progress panel for long searches */
+const progress = (() => {
+  let n = 0, pct = 0, timer = null, showT = null, bar = null;
+  const node = () => bar || (bar = document.body.appendChild(el('div', { className: 'nb-topbar', role: 'progressbar', 'aria-label': 'Loading' })));
+  const set = (p) => { pct = p; node().style.transform = `scaleX(${p / 100})`; };
+  return {
+    start() { if (n++ > 0) return; clearTimeout(showT);
+      showT = setTimeout(() => { const b = node(); b.classList.remove('done'); b.classList.add('on'); set(8);
+        timer = setInterval(() => set(pct + (92 - pct) * 0.06), 200); }, 150); },   // quick calls never flash
+    done() { if (n === 0 || --n > 0) return; clearTimeout(showT); clearInterval(timer);
+      if (!bar || !bar.classList.contains('on')) return; set(100); bar.classList.add('done');
+      setTimeout(() => { bar.classList.remove('on', 'done'); set(0); }, 450); },
+  };
+})();
+const _api = api;
+api = async (...a) => { progress.start(); try { return await _api(...a); } finally { progress.done(); } };
+
+// Progress panel for a long search, shown under `anchor` (the search card); results below it are dimmed until done.
+// The bar follows the time the same search took before (remembered per name), never claims 100% before the answer.
+function loadingPanel(anchor, { name, title, steps = [], estimate = 8 }) {
+  const key = 'nb-took-' + name; let est = estimate;
+  try { const v = +localStorage.getItem(key); if (v > 0) est = v; } catch { /* storage blocked */ }
+  const fill = el('div', { className: 'nb-lp-fill' }), step = el('div', { className: 'nb-lp-step' }), time = el('span', { className: 'nb-lp-time num' });
+  const list = el('ol', { className: 'nb-lp-steps' }, steps.map((s) => el('li', {}, s)));
+  const panel = el('section', { className: 'card nb-lp', role: 'status', 'aria-live': 'polite' },
+    el('div', { className: 'nb-lp-head' }, el('span', { className: 'spinner dark' }), el('b', {}, title), el('div', { style: { flex: 1 } }), time),
+    el('div', { className: 'nb-lp-bar' }, fill), step, steps.length > 1 ? list : null,
+    el('div', { className: 'nb-skel' }, [92, 78, 85, 64].map((w) => el('div', { style: { width: w + '%' } }))));
+  anchor.after(panel); const scope = anchor.parentElement; scope.classList.add('nb-busy');
+  const t0 = Date.now();
+  const tick = () => { const s = (Date.now() - t0) / 1000, f = 1 - Math.exp(-s / (est * 0.6)), p = Math.min(95, f * 100);
+    fill.style.width = p.toFixed(1) + '%';
+    const i = Math.min(steps.length - 1, Math.floor(f * steps.length));
+    if (steps.length) { step.textContent = steps[i] + '…'; [...list.children].forEach((li, j) => { li.className = j < i ? 'ok' : j === i ? 'now' : ''; }); }
+    time.textContent = `${s.toFixed(0)} s` + (s > est * 1.5 ? ' · taking longer than usual' : est > 3 ? ` · usually ~${Math.round(est)} s` : ''); };
+  tick(); const iv = setInterval(tick, 250);
+  return (ok = true) => { clearInterval(iv);
+    if (ok) try { localStorage.setItem(key, ((Date.now() - t0) / 1000 * 0.6 + est * 0.4).toFixed(1)); } catch { /* ignore */ }
+    fill.style.width = '100%'; scope.classList.remove('nb-busy'); setTimeout(() => panel.remove(), ok ? 200 : 0); };
+}
+
+/* XML in payloads: detect, pretty-print and convert to JSON (in the browser, nothing is sent anywhere) */
+const XML_START = /<(\?xml|[A-Za-z_][\w.-]*(:[\w.-]+)?[\s>/])/;
+// The XML part of a text: the whole text, or the part from the first tag to the last '>' (e.g. "Request: <soap:Envelope…>").
+function xmlPart(s) {
+  if (typeof s !== 'string') return null; const m = XML_START.exec(s); if (!m) return null;
+  const end = s.lastIndexOf('>'); if (end <= m.index) return null;
+  const xml = s.slice(m.index, end + 1);
+  const doc = new DOMParser().parseFromString(xml, 'application/xml');
+  return doc.getElementsByTagName('parsererror').length ? null : { doc, before: s.slice(0, m.index).trim(), after: s.slice(end + 1).trim() };
+}
+// Element -> JSON: attributes as "@name" (xmlns declarations dropped), repeated children become arrays,
+// text-only elements become their text, mixed text goes to "#text". Namespace prefixes are dropped (localName).
+function elToJson(e) {
+  const o = {};
+  for (const a of e.attributes) if (a.name !== 'xmlns' && !a.name.startsWith('xmlns:')) o['@' + a.localName] = a.value;
+  let text = '';
+  for (const c of e.childNodes) {
+    if (c.nodeType === 1) { const k = c.localName, v = elToJson(c); if (k in o) { if (!Array.isArray(o[k])) o[k] = [o[k]]; o[k].push(v); } else o[k] = v; } // child values are never arrays
+    else if (c.nodeType === 3 || c.nodeType === 4) text += c.nodeValue;
+  }
+  text = text.trim();
+  if (!Object.keys(o).length) return text;
+  if (text) o['#text'] = text;
+  return o;
+}
+const xmlDocToJson = (doc) => ({ [doc.documentElement.localName]: elToJson(doc.documentElement) });
+// Whole payload -> JSON: an XML text becomes its JSON; in a JSON payload every string value holding XML is replaced by its JSON.
+function payloadToJson(text) {
+  const x = xmlPart(text);
+  if (x) { const j = xmlDocToJson(x.doc); return x.before || x.after ? { ...(x.before ? { text: x.before } : {}), xml: j, ...(x.after ? { textAfter: x.after } : {}) } : j; }
+  let parsed; try { parsed = JSON.parse(text); } catch { return null; }
+  let found = false;
+  const walk = (v) => { if (typeof v === 'string') { const p = xmlPart(v); if (p) { found = true; return xmlDocToJson(p.doc); } return v; }
+    if (Array.isArray(v)) return v.map(walk); if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, w]) => [k, walk(w)])); return v; };
+  const out = walk(parsed); return found ? out : null;
+}
+function prettyXml(doc) {
+  const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const attrs = (e) => [...e.attributes].map((a) => ` ${a.name}="${esc(a.value).replace(/"/g, '&quot;')}"`).join('');
+  const rec = (e, ind) => { const kids = [...e.childNodes].filter((c) => c.nodeType === 1 || ((c.nodeType === 3 || c.nodeType === 4) && c.nodeValue.trim()));
+    if (!kids.length) return `${ind}<${e.nodeName}${attrs(e)}/>`;
+    if (kids.every((c) => c.nodeType !== 1)) return `${ind}<${e.nodeName}${attrs(e)}>${esc(kids.map((c) => c.nodeValue.trim()).join(' '))}</${e.nodeName}>`;
+    return `${ind}<${e.nodeName}${attrs(e)}>\n${kids.map((c) => c.nodeType === 1 ? rec(c, ind + '  ') : ind + '  ' + esc(c.nodeValue.trim())).join('\n')}\n${ind}</${e.nodeName}>`; };
+  return rec(doc.documentElement, '');
+}
+// A payload block with copy, and when it contains XML: a Raw / XML / JSON switch and a .json download.
+function payloadBlock(label, raw) {
+  const original = typeof raw === 'string' ? pretty(raw) : JSON.stringify(raw, null, 2);
+  const src = typeof raw === 'string' ? raw : JSON.stringify(raw);
+  const pre = el('pre'); showText(pre, original);
+  let current = original;
+  const json = payloadToJson(src);
+  const head = el('div', { className: 'ph' }, el('span', {}, label));
+  const tools = el('span', { className: 'ph-tools' });
+  if (json) {
+    const x = xmlPart(src);
+    const views = { raw: original, ...(x ? { xml: [x.before, prettyXml(x.doc), x.after].filter(Boolean).join('\n') } : {}), json: JSON.stringify(json, null, 2) };
+    const seg = el('span', { className: 'seg seg-sm' }, Object.keys(views).map((k) => {
+      const b = el('button', { type: 'button', 'aria-pressed': String(k === 'raw'), title: k === 'json' ? 'XML converted to JSON (attributes as @name)' : k === 'xml' ? 'XML indented' : 'As logged' }, k.toUpperCase());
+      b.onclick = () => { current = views[k]; showText(pre, current); [...seg.children].forEach((c) => c.setAttribute('aria-pressed', String(c === b))); };
+      return b; }));
+    const dl = el('button', { type: 'button', className: 'copy', title: 'Download as .json' }, '⤓ .json');
+    dl.onclick = () => { const a = el('a', { href: URL.createObjectURL(new Blob([views.json], { type: 'application/json' })), download: `${label}.json` }); a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000); };
+    tools.append(el('span', { className: 'pill', style: { '--c': 'var(--accent)' }, title: 'This payload contains XML: switch to JSON to read it as JSON' }, 'contains XML'), seg, dl);
+  }
+  const cp = el('button', { type: 'button', className: 'copy', title: 'Copy what is shown' }, 'copy');
+  cp.onclick = (e) => { e.stopPropagation(); navigator.clipboard.writeText(current).then(() => toast('Copied')); };
+  tools.append(cp); head.append(tools);
+  return el('div', {}, head, pre);
+}
+
+/* JSON colouring: keys, strings, numbers, true/false/null and punctuation get their own colour.
+   Built with text nodes (never innerHTML), so payload content cannot inject markup. */
+const JSON_TOKEN = /("(?:\\.|[^"\\])*")(\s*:)?|\b(true|false)\b|\bnull\b|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|[{}\[\],]/g;
+function highlightJson(text) {
+  const frag = document.createDocumentFragment(); let last = 0, m;
+  const span = (cls, t) => frag.append(el('span', { className: cls, textContent: t }));
+  JSON_TOKEN.lastIndex = 0;
+  while ((m = JSON_TOKEN.exec(text))) {
+    if (m.index > last) frag.append(text.slice(last, m.index));
+    if (m[1]) { if (m[2]) { span('j-key', m[1]); span('j-pun', m[2]); } else span('j-str', m[1]); }
+    else if (m[3]) span('j-bool', m[0]);
+    else if (m[0] === 'null') span('j-null', m[0]);
+    else if (/^[{}\[\],]$/.test(m[0])) span('j-pun', m[0]);
+    else span('j-num', m[0]);
+    last = JSON_TOKEN.lastIndex;
+  }
+  if (last < text.length) frag.append(text.slice(last));
+  return frag;
+}
+// Colour the text when it is JSON (very large payloads stay plain to keep the page fast).
+function showText(pre, text) {
+  let isJson = false; const t = text.trim();
+  if (t.length < 400000 && /^[{\[]/.test(t)) { try { JSON.parse(t); isJson = true; } catch { /* not JSON */ } }
+  pre.classList.toggle('json', isJson);
+  if (isJson) pre.replaceChildren(highlightJson(text)); else pre.textContent = text;
 }

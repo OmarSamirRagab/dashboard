@@ -11,11 +11,55 @@ powershell -ExecutionPolicy Bypass -File C:\Users\Sheen\ndc-case-investigator\st
 powershell -ExecutionPolicy Bypass -File C:\Users\Sheen\ndc-case-investigator\start.ps1 -Azure   # also Azure DevOps (Send to team leader)
 ```
 Secrets are asked for at start (hidden input), kept only in that process's environment, never written to disk or
-shell history. The script restarts the server if it crashes. Tests: `npm test` (Node's built-in runner, no dependencies).
+shell history. The script restarts the server if it crashes. It also asks for the UAT classification DB (see below; `-NoDb` skips it).
+Install once: `npm install` (only dependency: `mysql2`). Tests: `npm test` (Node's built-in runner).
 
 Code layout: `server.js` (HTTP routes only) · `lib/core.js` (OpenSearch + git/source helpers) · `lib/cases.js` ·
 `lib/exceptions.js` · `lib/failures.js` · `lib/ide.js` · `rules.js` (explanations) · `fixrules.js` / `fixer.js`
 (suggested fixes) · `report.js` (PDF) · `azdo.js` (Azure DevOps) · `test/`.
+
+## 🔍 Explain a failed booking (Booking failures → row → Explain)
+
+Side panel with (1) **the problem**: a one-line summary, the message, its explanation (`rules.js`) and FAILURE_MESSAGES
+entry, what to do; (2) **what the supplier answered**: the supplier calls of the session in the 30 min before the
+failure (same supplier + failed first, search calls last; the top 3 are read), HTTP status, the error / warning
+elements pulled out of the response (XML: `<Error>`, `<Message code>`, SOAP `faultstring`…; JSON: `errors[].code/title`…)
+each with its meaning, and the full response (RAW / XML / coloured JSON) and request. `lib/failexplain.js`,
+`GET /api/failure-explain?cid=&time=&supplier=&reason=`. Read-only.
+
+## CRM (Overview + Tickets)
+
+`http://127.0.0.1:8787/` sidebar → **Overview** (`/crm`) and **Tickets** (`/crm?view=tickets`). One ticket = one failed
+booking. Tickets are stored locally in `data/crm.json` (atomic writes, daily backup in `data/backups`, 14 kept;
+`CRM_DATA_DIR` changes the folder). Nothing is sent anywhere.
+
+- Create: **＋ Ticket** on a Booking failures row or a case, **＋ Tickets for all N shown** on Booking failures, or
+  **Import failures** (time range + filters, Preview first). Re-importing the same failure is skipped (session + ref + reason).
+- Tickets list: views (open / overdue / urgent / today), status tabs, search, filters, sort, bulk status/priority,
+  server-side pagination. Drawer: status, priority, follow-up date, tags, resolution, notes, full history.
+- The sidebar search accepts a ticket id (`T-00012`), booking ref, PNR or correlation id.
+- Cases and Booking failures tables are paginated too (page size remembered).
+
+## Classified vs unclassified (UAT `wonderdb.FAILURE_MESSAGES`)
+
+`start.ps1` asks for it at every start, like OpenSearch: host:port, user and hidden password (database `wonderdb`).
+Default host `192.168.1.71:3306`; type `-` to skip. After you enter the details it tests the connection
+(`tools/test-db.js`: reads FAILURE_MESSAGES, prints row count or the error with a hint) and lets you Retry / Skip /
+Continue. Host:port and user are remembered in `data/uat-db.json` after a successful test (never the password). Booking failures are
+then matched the way `FlightWSService.replaceSupplierErrorToFriendlyError` does: same supplier, `ERROR_MESSAGE`
+case-insensitive (the friendly message is matched too). A match from another supplier is marked `*`. With the DB
+connected, the DB decides: a failure not in FAILURE_MESSAGES goes to **Other / unclassified** in every view (tiles,
+chart, By reason, table, CSV/PDF), with the `rules.js` reason kept as a "Rule hint"; a DB match is never unclassified.
+
+**Handled by backend code = classified too.** A failure not in FAILURE_MESSAGES whose message is produced by odeysys
+itself (a literal in a constant, enum, `throw`, `setErrorMessage` or log in the `*.java` files of `GIT_REF`,
+e.g. "Your booking is being processed", duplicate booking, wallet balance) is classified with a
+**Backend code · File.java:line** badge (click opens IntelliJ). Lookup: `lib/backend.js` (`git grep` on the longest
+fixed piece of the message; lines that only compare with the text, `.contains("…")` / `.equals("…")`, don't count;
+`odeysysrest-tt` and properties files are never searched). The Classified tile shows "x in DB · y by backend code". Tiles show
+Classified / Unclassified (click to filter); the **Not in FAILURE_MESSAGES** table lists the gaps with a draft migration
+SQL to copy (review it, then add it as a Flyway migration in odeysys). The list is reloaded every 15 min
+(`POST /api/classify/reload` forces it). Without the DB the page says the DB is not connected and works as before.
 
 ## What changed (Exceptions page → What changed)
 
@@ -39,7 +83,7 @@ The Booking failures page lists **Unclassified messages** (no rule yet) – add 
 
 ## Run
 
-Node 18+ (no npm install needed). Credentials come only from environment variables.
+Node 18+ (`npm install` once for `mysql2`). Credentials come only from environment variables.
 
 PowerShell:
 ```powershell

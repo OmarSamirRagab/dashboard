@@ -13,6 +13,42 @@ const fixer = require('./fixer').createFixer({ git, GIT_REF, REPO_DIR, getJavaIn
 
 function send(res, code, obj) { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)); }
 
+// ---------------- CRM (tickets for failed bookings, local JSON store) ----------------
+const crm = require('./lib/crm');
+['SIGINT', 'SIGTERM'].forEach((s) => process.on(s, () => { try { crm.flush(); } finally { process.exit(0); } }));
+async function crmRoute(req, res, u, q) {
+  const p = u.pathname; const m = req.method;
+  if (!p.startsWith('/api/crm/')) return false;
+  const write = m !== 'GET';
+  if (write && !/^application\/json/.test(req.headers['content-type'] || '')) { send(res, 415, { error: 'JSON required' }); return true; }
+  const body = write ? await readBody(req) : null;
+  try {
+    let r; const idm = /^\/api\/crm\/tickets\/(T-\d+)(\/notes)?$/.exec(p);
+    if (p === '/api/crm/tickets' && m === 'GET') r = crm.list(q);
+    else if (p === '/api/crm/tickets' && m === 'POST') r = crm.create(body);
+    else if (idm && !idm[2] && m === 'GET') r = crm.get(idm[1]);
+    else if (idm && !idm[2] && m === 'PATCH') r = crm.update(idm[1], body);
+    else if (idm && !idm[2] && m === 'DELETE') r = crm.remove(idm[1]);
+    else if (idm && idm[2] && m === 'POST') r = crm.addNote(idm[1], body.text);
+    else if (p === '/api/crm/bulk' && m === 'POST') r = crm.bulk(body.ids, body.set || {});
+    else if (p === '/api/crm/stats' && m === 'GET') r = crm.stats();
+    else if (p === '/api/crm/lookup' && m === 'POST') r = crm.lookup((body.keys || []).slice(0, 10000));
+    else if (p === '/api/crm/meta' && m === 'GET') r = { statuses: crm.STATUSES, priorities: crm.PRIORITIES, open: crm.OPEN };
+    else if (p === '/api/crm/import' && m === 'POST') {
+      // Create tickets from booking failures (same data as the Booking failures page), skipping ones already tracked.
+      const to = body.to || new Date().toISOString(), from = body.from || new Date(Date.now() - 24 * 3600e3).toISOString();
+      const f = await bookingFailures({ from, to, agency: body.agency, supplier: body.supplier, pnr: body.pnr, cid: body.cid });
+      let rows = f.rows;
+      if (body.category) rows = rows.filter((x) => x.category === body.category);
+      if (Array.isArray(body.keys)) { const ks = new Set(body.keys); rows = rows.filter((x) => ks.has(crm.failureKey(x))); }
+      if (body.dryRun) { const have = crm.lookup(rows.map((x) => crm.failureKey(x))); r = { wouldCreate: rows.filter((x) => !have[crm.failureKey(x)]).length, alreadyTracked: Object.keys(have).length, total: rows.length }; }
+      else r = crm.importFailures(rows);
+    } else { send(res, 404, { error: 'not found' }); return true; }
+    send(res, write && m === 'POST' && r && r.created ? 201 : 200, r);
+  } catch (e) { send(res, e.status || 500, { error: e.message }); }
+  return true;
+}
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let s = ''; req.on('data', (d) => { s += d; if (s.length > 8e6) req.destroy(); });
@@ -25,6 +61,7 @@ const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, 'http://localhost');
   const q = Object.fromEntries(u.searchParams);
   try {
+    if (await crmRoute(req, res, u, q)) return;
     if (u.pathname === '/api/cases') {
       const p = req.method === 'POST' ? await readBody(req) : q;
       const items = Array.isArray(p.items) ? p.items.filter((x) => x && typeof x.ref === 'string' && x.ref.trim())
@@ -72,10 +109,15 @@ const server = http.createServer(async (req, res) => {
       try { return send(res, 200, await errorChanges({ at: q.at, to: q.to })); } catch (e) { return send(res, e.status || 500, { error: e.message }); }
     }
     if (u.pathname === '/api/merges') return send(res, 200, await recentMerges());
+    if (u.pathname === '/api/classify/status') return send(res, 200, require('./lib/classify').status());
+    if (u.pathname === '/api/classify/reload' && req.method === 'POST') {
+      if (!/^application\/json/.test(req.headers['content-type'] || '')) return send(res, 415, { error: 'JSON required' });
+      return send(res, 200, await require('./lib/classify').load());
+    }
     if (u.pathname === '/api/failures') {
       const to = q.to || new Date().toISOString(), from = q.from || new Date(Date.now() - 24 * 3600e3).toISOString();
       if (Date.parse(to) - Date.parse(from) > 31 * 24 * 3600e3) return send(res, 400, { error: 'Range too large (max 31 days).' });
-      return send(res, 200, await bookingFailures({ from, to, agency: q.agency, supplier: q.supplier }));
+      return send(res, 200, await bookingFailures({ from, to, agency: q.agency, supplier: q.supplier, pnr: q.pnr, cid: q.cid }));
     }
     if ((u.pathname === '/api/fix/propose' || u.pathname === '/api/fix/apply') && req.method === 'POST') {
       if (!/^application\/json/.test(req.headers['content-type'] || '')) return send(res, 415, { error: 'JSON required' });
@@ -97,11 +139,12 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, await codeFor({ className: q.cls, fileName: q.file, lineNumber: Number(q.line) }, q.host, 10));
     }
     if (u.pathname === '/api/doc' && q.id) return send(res, 200, await doc(q.id, q.index));
+    if (u.pathname === '/api/failure-explain' && q.cid) return send(res, 200, await require('./lib/failexplain').explainFailure({ cid: q.cid, time: q.time, supplier: q.supplier, reason: q.reason }));
     if (u.pathname === '/api/config') return send(res, 200, { osdUrl: OSD_URL, tenant: TENANT, indexPatternId: INDEX_PATTERN_ID,
       fix: { worktree: fixer.FIX_WORKTREE, gitRef: GIT_REF }, azdo: require('./azdo').settings() });
     const STATIC = { '/': 'index.html', '/index.html': 'index.html', '/exceptions': 'exceptions.html', '/exceptions.html': 'exceptions.html',
-      '/failures': 'failures.html', '/failures.html': 'failures.html',
-      '/app.css': 'app.css', '/common.js': 'common.js' };
+      '/failures': 'failures.html', '/failures.html': 'failures.html', '/crm': 'crm.html', '/crm.html': 'crm.html', '/tickets': 'crm.html',
+      '/app.css': 'app.css', '/common.js': 'common.js', '/crm.css': 'crm.css', '/crm-ui.js': 'crm-ui.js' };
     if (STATIC[u.pathname]) {
       const f = STATIC[u.pathname]; const type = f.endsWith('.css') ? 'text/css' : f.endsWith('.js') ? 'text/javascript' : 'text/html';
       res.writeHead(200, { 'Content-Type': `${type}; charset=utf-8`, 'Cache-Control': 'no-cache' });

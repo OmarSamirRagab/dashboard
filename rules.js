@@ -83,6 +83,14 @@ const RULES = [
     agent: ['Retrieve the PNR and check segment statuses; rebook if a segment is not confirmed.'],
     dev: [] },
 
+  { id: 'ndc-still-on-hold', impact: 'blocking',
+    test: has(/still in the hold stage|No ticket has been issued/i),
+    title: 'NDC booking still on hold – not ticketed',
+    what: 'The NDC supplier reports the order is still on hold and no ticket was issued.',
+    cause: 'Pay/ticket step did not complete at the supplier (payment to the airline not accepted, or ticketing still pending), so the order stayed in hold.',
+    agent: ['Check the order in the supplier / admin: if still held, pay it again or ask support to issue; do not rebook while the hold is active.'],
+    dev: ['Check the NDC pay-after-hold / ticketing response in the timeline for the supplier\'s reason.'] },
+
   { id: 'held-corporate-fare', impact: 'blocking',
     test: has(/does not allow amendments to held corporate fares/i),
     title: 'Held corporate fare cannot be amended',

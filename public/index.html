@@ -6,6 +6,7 @@
 <title>NDC · Not Booked Investigation</title>
 <script>document.documentElement.dataset.theme = localStorage.getItem('nb-theme') || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');</script>
 <link rel="stylesheet" href="/app.css">
+<link rel="stylesheet" href="/crm.css">
 </head>
 <body>
 <header class="bar">
@@ -86,6 +87,7 @@
 <div class="toast" id="toast"></div>
 
 <script src="/common.js"></script>
+<script src="/crm-ui.js"></script>
 <script>
 /* form */
 const toLocal = (d) => new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
@@ -136,10 +138,13 @@ $('#f').addEventListener('submit', async (ev) => {
   const u = new URLSearchParams(); if (refs.length) u.set('refs', items.map(x => x.created ? `${x.ref} ${fmtDate(x.created)}` : x.ref).join('\n')); if (body.agency) u.set('agency', body.agency);
   if (!body.autoRange || !refs.length) { u.set('from', body.from); u.set('to', body.to); }
   history.replaceState(null, '', '?' + u);
-  try { result = await api('/api/cases', body); result.took = (Date.now() - t0) / 1000; result.query = body; hidden.clear(); render();
+  const stop = loadingPanel(go.closest('section'), { name: 'cases', estimate: 6 + refs.length * 1.5, title: refs.length > 1 ? `Searching ${refs.length} booking refs` : 'Searching the case',
+    steps: ['Finding the sessions', 'Reading pay & book events', 'Payment gateway and supplier calls', 'Building the verdicts'] });
+  let ok = false;
+  try { result = await api('/api/cases', body); ok = true; result.took = (Date.now() - t0) / 1000; result.query = body; hidden.clear(); casePage = 1; render();
     if (result.rows.length === 1) openCase(result.rows[0]); }
   catch (e) { $('#err').hidden = false; $('#err').textContent = '⚠ ' + e.message; }
-  finally { go.disabled = false; $('.spinner', go)?.remove(); $('#goTxt').textContent = 'Find cases'; }
+  finally { stop(ok); go.disabled = false; $('.spinner', go)?.remove(); $('#goTxt').textContent = 'Find cases'; }
 });
 
 function render() {
@@ -178,7 +183,9 @@ function render() {
   if (!rows.length) { $('#casesWrap').replaceChildren(el('div', { className: 'empty' }, el('div', { className: 'big' }, 'No sessions found'), 'Check the references and the time range.')); return; }
   const tb = el('tbody');
   let prev = null;
-  for (const c of shown) {
+  // Paginate the sessions (25/50/100 per page); group headers repeat on each page.
+  const pages = Math.max(1, Math.ceil(shown.length / casePageSize)); if (casePage > pages) casePage = pages;
+  for (const c of pageSlice(shown, casePage, casePageSize)) {
     if (byRef && c.ref + c.created !== prev) { prev = c.ref + c.created; const n = shown.filter(x => x.ref === c.ref && x.created === c.created).length;
       tb.append(el('tr', { className: 'grp' }, el('td', { colSpan: 6 }, el('span', { className: 'mono ref', textContent: c.ref }), copyBtn(c.ref),
         c.created ? el('span', { className: 'muted num', style: { marginLeft: '10px', fontSize: '12.5px' } }, `created ${fmtDate(c.created)}`) : null,
@@ -196,8 +203,10 @@ function render() {
     tr.dataset.cid = c.correlationId; tb.append(tr);
   }
   $('#casesWrap').replaceChildren(el('table', { className: 'tbl' },
-    el('thead', {}, el('tr', {}, ['Verdict', 'Pay & book', 'Agency', 'Supplier', 'Last activity', 'Events'].map((h, i) => el('th', { textContent: h, style: i === 5 ? { textAlign: 'right' } : {} })))), tb));
+    el('thead', {}, el('tr', {}, ['Verdict', 'Pay & book', 'Agency', 'Supplier', 'Last activity', 'Events'].map((h, i) => el('th', { textContent: h, style: i === 5 ? { textAlign: 'right' } : {} })))), tb),
+    shown.length > 25 ? paginator({ total: shown.length, page: casePage, size: casePageSize, onChange: (p, s) => { casePage = p; casePageSize = s; localStorage.setItem('nb-case-size', s); render(); $('#casesCard').scrollIntoView({ behavior: 'smooth' }); } }) : '');
 }
+let casePage = 1, casePageSize = +localStorage.getItem('nb-case-size') || 25;
 
 /* pay & book focus: bookAndPay → processMakePayment → payment gateway → supplier book */
 const STEP = { ok: ['✓', 'var(--good)', 'done'], error: ['✕', 'var(--critical)', 'error'], pending: ['‖', 'var(--warning)', 'no result'], missing: ['○', 'var(--neutral)', 'not reached'], none: ['–', 'var(--neutral)', 'n/a'] };
@@ -254,6 +263,10 @@ async function openCase(c) {
   document.querySelector(`tr.case[data-cid="${CSS.escape(c.correlationId)}"]`)?.classList.add('sel');
   $('#dh').replaceChildren(
     el('div', { className: 'dh-top' }, el('h3', { className: 'mono', textContent: c.ref || c.refs[0] || 'Session' }), pill(c.kind), el('div', { style: { flex: 1 } }),
+      el('button', { className: 'iconbtn', type: 'button', title: 'Track this case as a CRM ticket', onclick: async (e) => { e.currentTarget.disabled = true;
+        try { const t = await createTicket({ ref: c.ref || (c.refs || [])[0] || '', cid: c.correlationId, agencyCode: c.agencyCode, agencyName: c.agencyName, supplier: (c.suppliers || [])[0] || '',
+          category: (KINDS[c.kind] || KINDS.unknown).label, reason: c.verdict, failureTime: c.last, banqueMisr: c.kind === 'not-booked-bm', priority: c.kind === 'not-booked-bm' ? 'high' : undefined });
+          location.href = '/crm?view=tickets&open=' + t.id; } catch (err) { toast('⚠ ' + err.message); } } }, '＋ Ticket'),
       el('a', { className: 'iconbtn', href: '/exceptions?cid=' + encodeURIComponent(c.correlationId), style: { textDecoration: 'none' } }, '⚡ Explain exceptions'),
       el('a', { className: 'iconbtn', href: osdLink(c.correlationId), target: '_blank', rel: 'noopener', style: { textDecoration: 'none' } }, 'Open in OpenSearch ↗'),
       el('button', { className: 'iconbtn', type: 'button', onclick: closeDrawer, title: 'Close (Esc)' }, '✕')),
@@ -312,8 +325,7 @@ function renderTimeline() {
     const more = el('button', { type: 'button', className: 'linkbtn', textContent: 'Show request / response' });
     more.onclick = async () => { more.textContent = 'Loading…';
       try { const d = await api(`/api/doc?id=${encodeURIComponent(e.id)}&index=${encodeURIComponent(e.index)}`); more.remove();
-        const parts = ['request', 'response', 'returnValue', 'stacktrace', 'body'].filter(k => d[k]).map(k => { const txt = typeof d[k] === 'string' ? pretty(d[k]) : JSON.stringify(d[k], null, 2);
-          return el('div', {}, el('div', { className: 'ph' }, k, copyBtn(txt, 'copy')), el('pre', { textContent: txt })); });
+        const parts = ['request', 'response', 'returnValue', 'stacktrace', 'body'].filter(k => d[k]).map(k => payloadBlock(k, d[k]));
         body.append(el('div', { className: 'payload' }, parts.length ? parts : el('span', { className: 'muted' }, 'No payload logged for this event.'))); }
       catch (err) { more.textContent = '⚠ ' + err.message; } };
     body.append(el('div', { style: { marginTop: '4px' } }, more));

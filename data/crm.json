@@ -1,0 +1,46 @@
+{
+ "version": 1,
+ "seq": 1,
+ "tickets": [
+  {
+   "id": "T-00001",
+   "title": "Other / unclassified – NDCEG-BR-F261116L3CMms",
+   "ref": "NDCEG-BR-F261116L3CMms",
+   "pnr": "",
+   "cid": "drM13UI-H19xoRWBup8nOnQc1SQohJZYX7pCtJNF",
+   "failureKey": "drM13UI-H19xoRWBup8nOnQc1SQohJZYX7pCtJNF|NDCEG-BR-F261116L3CMms|Please make sure each segment starts from the city where the previous segment arrived.",
+   "source": "manual",
+   "agencyCode": "AGN21677",
+   "agencyName": "Mr Mohamed Mohamed Mansour",
+   "supplier": "Galileo",
+   "category": "Other / unclassified",
+   "reason": "Please make sure each segment starts from the city where the previous segment arrived.",
+   "action": "Escalate to development with the session id if it blocks the booking.",
+   "banqueMisr": false,
+   "failureTime": "2026-11-16T20:08:49.573Z",
+   "status": "investigating",
+   "priority": "normal",
+   "owner": "me",
+   "tags": [],
+   "dueAt": null,
+   "resolution": "",
+   "createdAt": "2026-11-17T10:52:54.988Z",
+   "updatedAt": "2026-11-17T10:53:42.074Z",
+   "notes": [],
+   "history": [
+    {
+     "at": "2026-11-17T10:52:54.988Z",
+     "action": "created"
+    },
+    {
+     "at": "2026-11-17T10:53:42.074Z",
+     "action": "changed",
+     "field": "status",
+     "from": "new",
+     "to": "investigating"
+    }
+   ],
+   "closedAt": null
+  }
+ ]
+}
