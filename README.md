@@ -186,3 +186,26 @@ Notes:
 - Payment-gateway logs carry no agency code; agency-only searches list the agency's `processMakePayment` sessions.
 - Bank callbacks may run under a different `correlationId` and won't appear in the session timeline.
 - Uses the OpenSearch Dashboards internal search API (`/internal/search/opensearch`), which can change between OSD versions.
+
+## Performance page
+
+`http://127.0.0.1:8787/performance` (tab **Performance**): times the Odeysys REST endpoints on a **local WildFly** and
+suggests fixes. Start with `start.ps1 -Perf` (asks for the local admin/portal URLs and a test login, kept in memory only).
+
+- **Endpoints** are read from the `@RestController` classes of `odeysysadmin-tt` and `odeysysportal-tt` in `GIT_REF`
+  (class + method `@RequestMapping`/`@GetMapping`…, `String` constants resolved, DispatcherServlet prefix from `web.xml`).
+- **What is called:** read-only GETs only. GETs whose path or method name contains a change verb (delete, save, cancel,
+  book, issue, pay…) and every POST/PUT/DELETE are skipped. To time those (e.g. airline search) list them in
+  `perf.endpoints.json` with test data – copy `perf.endpoints.example.json`. The same file holds the login call and
+  sample values (`params`) for `{id}` path variables and required request parameters.
+- **Safety:** runs are refused unless the base URL is localhost/127.0.0.1 (`PERF_ALLOW_REMOTE=1` overrides). The page can
+  only start endpoints the server discovered or that are in the config file, never arbitrary URLs.
+- **Timing:** one first call (cold), then N timed calls one after another (1–4 in parallel if you choose). *Typical* =
+  median of the timed calls; also first byte, size, compression and row count of the largest JSON list.
+- **Suggested fixes:** *measured* (slow, cold start, unstable, large or uncompressed response, too many rows, errors,
+  not logged in) and *code pattern* for endpoints over the target: the handler plus the service/DAO methods it calls
+  (2 levels) are checked for DB calls in loops (N+1), external calls in loops or in sequence, `JAXBContext.newInstance`
+  / `new ObjectMapper()` per call, `Thread.sleep`, unpaged `findAll`/`list()`, counting by loading rows, payload
+  logging at INFO, `synchronized`, reference data read without cache. Code patterns are likely causes, not proof.
+- **Before/after:** *Save as baseline*, apply a fix, run again: the *vs baseline* column shows the change. Results are
+  stored in `perf-results/` (git-ignored). Env: `PERF_ADMIN_URL`, `PERF_PORTAL_URL`, `PERF_USER`, `PERF_PASS`, `PERF_FILE`.

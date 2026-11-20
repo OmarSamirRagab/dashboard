@@ -4,8 +4,9 @@
 #
 #   powershell -ExecutionPolicy Bypass -File C:\Users\Sheen\ndc-case-investigator\start.ps1
 #   ... -Azure            also ask for Azure DevOps settings (Send to team leader)
+#   ... -Perf             also ask for the Odeysys test login (Performance page)
 #   ... -Port 8787        change the port
-param([switch]$Azure, [int]$Port = 8787)
+param([switch]$Azure, [switch]$Perf, [int]$Port = 8787)
 
 $ErrorActionPreference = 'Stop'
 Set-Location -Path $PSScriptRoot
@@ -24,6 +25,13 @@ if ($Azure) {
     if (-not $env:AZDO_PROJECT) { $env:AZDO_PROJECT = Read-Host -Prompt 'Azure DevOps project' }
     if (-not $env:AZDO_PAT)     { $env:AZDO_PAT = Read-Secret 'Azure DevOps personal access token (Work Items Read & Write)' }
     if (-not $env:AZDO_TEAM_LEADER) { $env:AZDO_TEAM_LEADER = Read-Host -Prompt 'Team leader e-mail (optional, Enter to skip)' }
+}
+
+if ($Perf) {
+    if (-not $env:PERF_ADMIN_URL)  { $env:PERF_ADMIN_URL = Read-Host -Prompt 'Local admin URL [http://127.0.0.1:8080/odeysysadmin]'; if (-not $env:PERF_ADMIN_URL) { $env:PERF_ADMIN_URL = 'http://127.0.0.1:8080/odeysysadmin' } }
+    if (-not $env:PERF_PORTAL_URL) { $env:PERF_PORTAL_URL = Read-Host -Prompt 'Local portal URL [http://127.0.0.1:8080/odeysysportal]'; if (-not $env:PERF_PORTAL_URL) { $env:PERF_PORTAL_URL = 'http://127.0.0.1:8080/odeysysportal' } }
+    if (-not $env:PERF_USER) { $env:PERF_USER = Read-Host -Prompt 'Odeysys test user (local)' }
+    if (-not $env:PERF_PASS) { $env:PERF_PASS = Read-Secret 'Odeysys test password' }
 }
 
 $env:NDC_PORT = "$Port"

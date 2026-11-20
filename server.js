@@ -97,10 +97,30 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, await codeFor({ className: q.cls, fileName: q.file, lineNumber: Number(q.line) }, q.host, 10));
     }
     if (u.pathname === '/api/doc' && q.id) return send(res, 200, await doc(q.id, q.index));
+    if (u.pathname.startsWith('/api/perf/')) {
+      const perf = require('./lib/perf');
+      try {
+        if (u.pathname === '/api/perf/endpoints') return send(res, 200, await perf.discover(q.refresh === '1'));
+        if (u.pathname === '/api/perf/status') return send(res, 200, perf.status());
+        if (u.pathname === '/api/perf/report') {
+          const th = { warn: Math.max(100, Number(q.warn) || 1000), crit: Math.max(200, Number(q.crit) || 5000) };
+          return send(res, 200, await perf.report(['last', 'baseline', 'current'].includes(q.run) ? q.run : 'current', th));
+        }
+        if (u.pathname === '/api/perf/analyze' && q.id) return send(res, 200, await perf.analyze(q.id));
+        if (req.method === 'POST') {
+          // JSON only: forces a CORS preflight, so other web pages cannot start runs against the local backend.
+          if (!/^application\/json/.test(req.headers['content-type'] || '')) return send(res, 415, { error: 'JSON required' });
+          const b = await readBody(req);
+          if (u.pathname === '/api/perf/run') return send(res, 200, await perf.startRun(b));
+          if (u.pathname === '/api/perf/stop') return send(res, 200, perf.stopRun());
+          if (u.pathname === '/api/perf/baseline') return send(res, 200, perf.saveBaseline());
+        }
+      } catch (e) { console.error(`[server][${u.pathname}] ${e.message}`); return send(res, e.status || 500, { error: e.message }); }
+    }
     if (u.pathname === '/api/config') return send(res, 200, { osdUrl: OSD_URL, tenant: TENANT, indexPatternId: INDEX_PATTERN_ID,
       fix: { worktree: fixer.FIX_WORKTREE, gitRef: GIT_REF }, azdo: require('./azdo').settings() });
     const STATIC = { '/': 'index.html', '/index.html': 'index.html', '/exceptions': 'exceptions.html', '/exceptions.html': 'exceptions.html',
-      '/failures': 'failures.html', '/failures.html': 'failures.html',
+      '/failures': 'failures.html', '/failures.html': 'failures.html', '/performance': 'performance.html', '/performance.html': 'performance.html',
       '/app.css': 'app.css', '/common.js': 'common.js' };
     if (STATIC[u.pathname]) {
       const f = STATIC[u.pathname]; const type = f.endsWith('.css') ? 'text/css' : f.endsWith('.js') ? 'text/javascript' : 'text/html';

@@ -46,7 +46,7 @@ main { max-width: 1480px; margin: 0 auto; padding: 20px 24px 60px; display: grid
 .field { display: grid; gap: 6px; }
 .field > span { font-size: 12px; font-weight: 600; color: var(--ink-2); display: flex; gap: 6px; align-items: center; }
 .count { font-weight: 600; font-size: 11px; padding: 0 7px; border-radius: 10px; background: var(--accent-wash); color: var(--accent); }
-textarea, input[type=text], input[type=datetime-local] { width: 100%; background: var(--raised); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; outline: none; }
+textarea, input[type=text], input[type=datetime-local], input[type=number] { width: 100%; background: var(--raised); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; outline: none; }
 textarea { resize: vertical; min-height: 96px; font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; }
 textarea:focus, input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-wash); }
 .hint { font-size: 12px; color: var(--muted); }
@@ -291,3 +291,20 @@ kbd { font: 11px ui-monospace, monospace; border: 1px solid var(--border); borde
 .modal-h { display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--border); }
 .modal-b { padding: 14px 16px; display: grid; gap: 10px; }
 .modal-b textarea { font-family: system-ui, sans-serif; font-size: 13px; }
+
+/* performance page */
+.verb { display: inline-block; font-size: 10.5px; font-weight: 700; padding: 1px 6px; border-radius: 4px; background: var(--surface-2); border: 1px solid var(--border); color: var(--ink-2); }
+.verb[data-v="GET"] { color: var(--accent); }
+.eplist { max-height: 420px; overflow: auto; border-top: 1px solid var(--grid); }
+.eplist .tbl th { top: 0; }
+.eplist .tbl td { padding: 6px 12px; }
+.progress { height: 6px; background: var(--surface-2); border-radius: 3px; margin-top: 8px; overflow: hidden; }
+.progress div { height: 6px; background: var(--accent); border-radius: 3px; transition: width .3s; }
+.bl-cold { position: absolute; top: -3px; width: 2px; height: 14px; background: var(--ink-2); border-radius: 1px; }
+.bl-th { position: absolute; top: -3px; height: 14px; border-left: 1px dashed var(--axis); }
+tr.detail > td { background: var(--surface-2); cursor: default; }
+.perf-detail { display: grid; gap: 10px; }
+.kvline { display: flex; flex-wrap: wrap; gap: 4px 18px; font-size: 12.5px; }
+.flist { display: grid; gap: 8px; }
+.fitem { display: grid; grid-template-columns: 96px 1fr; gap: 10px; font-size: 13.5px; }
+.fitem .pill { justify-self: start; }
