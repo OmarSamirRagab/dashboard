@@ -114,6 +114,8 @@ const server = http.createServer(async (req, res) => {
           if (u.pathname === '/api/perf/run') return send(res, 200, await perf.startRun(b));
           if (u.pathname === '/api/perf/stop') return send(res, 200, perf.stopRun());
           if (u.pathname === '/api/perf/baseline') return send(res, 200, perf.saveBaseline());
+          if (u.pathname === '/api/perf/params') return send(res, 200, await perf.saveParams(b.params));
+          if (u.pathname === '/api/perf/dbfill') return send(res, 200, await perf.fillFromDb());
         }
       } catch (e) { console.error(`[server][${u.pathname}] ${e.message}`); return send(res, e.status || 500, { error: e.message }); }
     }

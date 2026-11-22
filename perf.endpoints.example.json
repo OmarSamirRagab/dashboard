@@ -2,15 +2,16 @@
   "_help": [
     "Copy to perf.endpoints.json (same folder) and edit. Only used by the Performance page.",
     "login: how the runner logs in per app before calling endpoints. Cookies (JSESSIONID) are kept automatically.",
+    "  The body is sent as JSON (/Admin2/loginAction answers 415 to a form post); form: true posts it as an HTML form instead. failIf = regex on the redirect URL or page text that means the login failed.",
     "  token = dot path of the token in the JSON login response; it is then sent as <header>: <prefix><token>. Leave token out for cookie-only login.",
-    "  ${PERF_USER} / ${PERF_PASS} are replaced from environment variables (start.ps1 -Perf asks for them). Never put passwords in this file.",
+    "  ${PERF_...} placeholders are replaced from environment variables: PERF_USER, PERF_PASS (admin), PERF_PORTAL_AGENCY, PERF_PORTAL_EMAIL, PERF_PORTAL_PASS (portal). start.ps1 -Perf asks for them. Never put passwords in this file.",
     "params: sample values for path variables {id} and required @RequestParam by name, so more GET endpoints can be called.",
     "endpoints: extra endpoints to time, including POST (e.g. airline search). These ARE called with the given body: use test data only.",
     "The paths below are placeholders - replace them with the real ones from the controllers."
   ],
   "login": {
-    "admin": { "method": "POST", "path": "/v2/login", "body": { "userName": "${PERF_USER}", "password": "${PERF_PASS}" }, "token": "data.token", "header": "Authorization", "prefix": "Bearer " },
-    "portal": { "method": "POST", "path": "/v2/login", "body": { "userName": "${PERF_USER}", "password": "${PERF_PASS}" }, "token": "data.token", "header": "Authorization", "prefix": "Bearer " }
+    "admin": { "method": "POST", "path": "/Admin2/loginAction","body": { "userName": "${PERF_USER}", "password": "${PERF_PASS}" }, "failIf": "invalid|incorrect|wrong password" },
+    "portal": { "method": "POST", "path": "/v2/auth/loginAction", "body": { "agencyCode": "${PERF_PORTAL_AGENCY}", "email": "${PERF_PORTAL_EMAIL}", "password": "${PERF_PORTAL_PASS}" }, "failIf": "invalid|incorrect|wrong password" }
   },
   "params": {
     "id": "1",

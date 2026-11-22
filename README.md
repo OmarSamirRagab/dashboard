@@ -209,3 +209,15 @@ suggests fixes. Start with `start.ps1 -Perf` (asks for the local admin/portal UR
   logging at INFO, `synchronized`, reference data read without cache. Code patterns are likely causes, not proof.
 - **Before/after:** *Save as baseline*, apply a fix, run again: the *vs baseline* column shows the change. Results are
   stored in `perf-results/` (git-ignored). Env: `PERF_ADMIN_URL`, `PERF_PORTAL_URL`, `PERF_USER`, `PERF_PASS`, `PERF_FILE`.
+
+### Values from the local DB and read-only POSTs
+
+`start.ps1 -Perf` also asks for a local MySQL schema and a **read-only** user (`PERF_DB_HOST/PORT/NAME/USER/PASS`, Enter
+at the schema prompt skips it). **⛁ Fill values from DB** reads `information_schema` and one value per needed column
+(`SELECT … LIMIT 1`, read-only session, 3 s limit per query) through MySQL Shell (`mysqlsh`, or set `MYSQLSH`).
+Values are matched by name: `airlineId` → primary key of the airline table, `{id}` → primary key of the table named
+in the path (`/Master2/airline/{id}`), other names only when the column exists in ≤ 3 tables. Order: value typed on the
+page > DB > generated (date ranges, paging). Cached in `perf-results/dbvalues.json`.
+POST endpoints whose name only reads (search, list, filter, report, export…) and has no change word are now called
+with a body built from the `@RequestBody` DTO (unknown fields left out). Login, OTP, register, password and verify
+endpoints are never called.

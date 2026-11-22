@@ -82,6 +82,13 @@ function renderTargets() {
     a.local || eps.allowRemote ? null : sevPill('critical', 'not local – runs are refused'),
     el('span', { className: 'muted' }, `${a.controllers} controllers · dispatcher ${a.pattern || '/'}${a.note ? ' · ' + a.note : ''}`),
     eps.login[a.key] ? sevPill('good', 'login configured') : sevPill('warning', 'no login in perf.endpoints.json')));
+  const db = eps.db || {};
+  const fillBtn = el('button', { type: 'button', className: 'iconbtn', disabled: !db.configured, title: 'Read the schema and one sample value per needed column (SELECT … LIMIT 1, read-only session)' }, '⛁ Fill values from DB');
+  fillBtn.onclick = fillFromDb;
+  t.push(el('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, el('b', { style: { minWidth: '52px' } }, 'db'),
+    db.configured ? el('span', { className: 'mono' }, db.db) : sevPill('warning', 'not configured – start.ps1 -Perf asks for the MySQL schema and a read-only user'),
+    db.columns ? el('span', { className: 'muted' }, `${db.columns.toLocaleString()} columns · ${db.values.toLocaleString()} sample values${db.at ? ' · ' + fmtDate(db.at) : ''}${db.missing ? ` · ${db.missing} not looked up yet` : ''}`) : null,
+    fillBtn));
   t.push(el('div', { className: 'muted', style: { fontSize: '12.5px' } }, `Source: ${eps.ref} (git). Base URLs: PERF_ADMIN_URL / PERF_PORTAL_URL. `,
     eps.configFound ? `Config: ${eps.configFile}` : `No ${eps.configFile} yet – copy perf.endpoints.example.json to add login, sample values and POST endpoints.`));
   $('#targets').replaceChildren(...t);
@@ -109,13 +116,66 @@ function renderList() {
     return el('tr', {}, el('td', {}, cb), el('td', {}, verb(e.verb)),
       el('td', { className: 'mono', style: { fontSize: '12.5px', wordBreak: 'break-all' } }, e.name ? el('b', { style: { fontFamily: 'system-ui' } }, e.name + ' ') : null, e.fullPath),
       el('td', { className: 'ink2', style: { fontSize: '12.5px' } }, e.app, e.className ? el('div', { className: 'muted mono', style: { fontSize: '11.5px' } }, `${e.className}.${e.methodName}()`) : null),
-      el('td', { style: { fontSize: '12.5px' } }, e.status.run ? el('span', { className: 'muted' }, e.status.why) : el('span', { className: 'ink2' }, e.status.why)));
+      el('td', { style: { fontSize: '12.5px' } }, e.status.run ? el('span', { className: 'muted' }, e.status.why) : el('span', { className: 'ink2' }, e.status.why), valuesLine(e)));
   }));
   const more = rows.length > ui.limit ? el('button', { type: 'button', className: 'iconbtn', onclick: () => { ui.limit += 300; renderList(); } }, `Show more (${rows.length - ui.limit} left)`) : null;
-  $('#list').replaceChildren(el('div', { className: 'eplist' }, el('table', { className: 'tbl' },
+  $('#list').replaceChildren(ui.show === 'input' || ui.show === 'all' ? paramsPanel() : null, el('div', { className: 'eplist' }, el('table', { className: 'tbl' },
     el('thead', {}, el('tr', {}, el('th', {}, head), ...['Method', 'Path', 'App · handler', 'Called?'].map(h => el('th', { textContent: h })))), tb)),
     el('div', { className: 'card-b', style: { display: 'flex', gap: '12px', alignItems: 'center' } }, more, el('span', { className: 'muted' }, `${rows.length} shown`),
-      ui.show === 'input' ? el('span', { className: 'muted', style: { fontSize: '12.5px' } }, 'Add values to "params" in perf.endpoints.json (e.g. "id": "1"), then ↻ Rescan.') : null));
+      ui.show === 'input' ? el('span', { className: 'muted', style: { fontSize: '12.5px' } }, 'Enter sample values above and press Save – the endpoints become runnable.') : null));
+}
+
+/* the values an endpoint will be called with, and where each comes from */
+const SRC = { manual: 'typed', db: 'db', generated: 'auto' };
+function valuesLine(e) {
+  const v = { ...(e.values || {}), ...(e.bodyValues || {}) }; const keys = Object.keys(v);
+  if (!keys.length && !e.body) return null;
+  const line = el('div', { className: 'vals mono' }, keys.map(k => el('span', { title: v[k].col ? `from ${v[k].col}` : SRC[v[k].src] }, `${k}=${v[k].v}`, el('i', {}, SRC[v[k].src]))));
+  if (e.body && e.source === 'code') line.append(el('span', { title: JSON.stringify(e.body, null, 2) }, `body ${e.bodyType || ''} {${Object.keys(e.body).length} fields}`, el('i', {}, 'hover')));
+  return line;
+}
+async function fillFromDb(ev) {
+  const b = ev.currentTarget; b.disabled = true; b.textContent = 'Reading the DB…'; hideErr();
+  try {
+    const before = new Set(eps.endpoints.filter(e => e.status.run).map(e => e.id));
+    eps = await api('/api/perf/dbfill', {});
+    const added = eps.endpoints.filter(e => e.status.run && !before.has(e.id)); added.forEach(e => sel.add(e.id));
+    toast(`DB: ${eps.fill.looked} columns read${eps.fill.failed ? `, ${eps.fill.failed} failed` : ''} · ${added.length} more endpoint${added.length === 1 ? '' : 's'} can be called`);
+    renderTargets(); renderList();
+  } catch (e) { showErr(e.message); b.disabled = false; b.textContent = '⛁ Fill values from DB'; }
+}
+
+/* sample values for {path variables} and required request params, shared by name (one "id" serves every endpoint that needs an id) */
+const draft = {};
+function paramsPanel() {
+  const need = new Map();
+  for (const e of eps.endpoints) if (!ui.app || e.app === ui.app) for (const n of (e.status.missing || [])) need.set(n, (need.get(n) || 0) + 1);
+  const saved = eps.params || {};
+  const names = [...new Set([...[...need.entries()].sort((a, b) => b[1] - a[1]).map(([n]) => n), ...Object.keys(saved).sort()])];
+  if (!names.length) return null;
+  const save = el('button', { type: 'button', className: 'primary' }, 'Save values');
+  save.onclick = async () => {
+    const before = new Set(eps.endpoints.filter(e => e.status.run).map(e => e.id));
+    save.disabled = true;
+    try {
+      eps = await api('/api/perf/params', { params: { ...draft } });
+      const added = eps.endpoints.filter(e => e.status.run && !before.has(e.id));
+      added.forEach(e => sel.add(e.id)); for (const k of Object.keys(draft)) delete draft[k];
+      toast(added.length ? `${added.length} more endpoint${added.length > 1 ? 's' : ''} can be called now` : 'Saved');
+      renderTargets(); renderList();
+    } catch (e) { toast('⚠ ' + e.message); save.disabled = false; }
+  };
+  return el('div', { className: 'card-b params' },
+    el('div', { style: { display: 'flex', gap: '10px', alignItems: 'baseline', flexWrap: 'wrap' } }, el('b', {}, 'Sample values'),
+      el('span', { className: 'muted', style: { fontSize: '12.5px' } }, 'Filled into {path variables} and required parameters by name. Use test data – saved in perf.endpoints.json. Clear a box to remove the value.')),
+    el('div', { className: 'pgrid' }, names.map(n => {
+      const inp = el('input', { type: 'text', value: draft[n] ?? saved[n] ?? '', placeholder: need.has(n) ? 'needed' : '' });
+      inp.oninput = () => { draft[n] = inp.value; };
+      inp.onkeydown = (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); draft[n] = inp.value; save.click(); } };
+      return el('label', { className: 'field' }, el('span', {}, el('span', { className: 'mono' }, n), ' ',
+        el('span', { className: 'muted', style: { fontWeight: 400 } }, need.has(n) ? `· ${need.get(n)} endpoint${need.get(n) > 1 ? 's' : ''}` : saved[n] !== undefined ? '· saved' : '')), inp);
+    })),
+    el('div', {}, save));
 }
 
 /* ---------------- run ---------------- */
@@ -278,6 +338,7 @@ function rowDetail(r, e) {
     el('span', {}, el('span', { className: 'muted' }, 'first byte '), ms(r.ttfb)),
     el('span', {}, el('span', { className: 'muted' }, 'type '), `${r.type || '—'}${r.encoding ? ' · ' + r.encoding : ' · not compressed'}`),
     r.location ? el('span', {}, el('span', { className: 'muted' }, 'redirect → '), el('span', { className: 'mono' }, r.location)) : null));
+  if (r.sent) box.append(el('div', {}, el('div', { className: 'muted', style: { fontSize: '12px' } }, 'Request body sent ', copyBtn(r.sent)), el('pre', {}, pretty(r.sent))));
   const list = el('div', { className: 'flist' }); box.append(list);
   const show = (fs) => list.replaceChildren(...(fs.length ? fs : [{ sev: 'good', title: 'No problems found', detail: 'Within the target and no known slow code patterns.', kind: 'measured' }]).map(f =>
     el('div', { className: 'fitem' }, el('div', {}, sevPill(f.sev)),
