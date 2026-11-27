@@ -46,7 +46,7 @@ main { max-width: 1480px; margin: 0 auto; padding: 20px 24px 60px; display: grid
 .field { display: grid; gap: 6px; }
 .field > span { font-size: 12px; font-weight: 600; color: var(--ink-2); display: flex; gap: 6px; align-items: center; }
 .count { font-weight: 600; font-size: 11px; padding: 0 7px; border-radius: 10px; background: var(--accent-wash); color: var(--accent); }
-textarea, input[type=text], input[type=datetime-local] { width: 100%; background: var(--raised); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; outline: none; }
+textarea, input[type=text], input[type=datetime-local], input[type=number] { width: 100%; background: var(--raised); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; outline: none; }
 textarea { resize: vertical; min-height: 96px; font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; }
 textarea:focus, input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-wash); }
 .hint { font-size: 12px; color: var(--muted); }
@@ -349,3 +349,45 @@ pre.json .j-bool { color: var(--j-bool); font-weight: 600; } pre.json .j-null { 
 .xp-means { display: flex; gap: 6px; align-items: flex-start; font-size: 13px; }
 .xp-req summary { cursor: pointer; font-size: 12.5px; color: var(--ink-2); margin: 4px 0; }
 .xp-btn { font-size: 12.5px; padding: 4px 10px; }
+
+/* performance page */
+.verb { display: inline-block; font-size: 10.5px; font-weight: 700; padding: 1px 6px; border-radius: 4px; background: var(--surface-2); border: 1px solid var(--border); color: var(--ink-2); }
+.verb[data-v="GET"] { color: var(--accent); }
+.eplist { max-height: 420px; overflow: auto; border-top: 1px solid var(--grid); }
+.eplist .tbl th { top: 0; }
+.eplist .tbl td { padding: 6px 12px; }
+.progress { height: 6px; background: var(--surface-2); border-radius: 3px; margin-top: 8px; overflow: hidden; }
+.progress div { height: 6px; background: var(--accent); border-radius: 3px; transition: width .3s; }
+.bl-cold { position: absolute; top: -3px; width: 2px; height: 14px; background: var(--ink-2); border-radius: 1px; }
+.bl-th { position: absolute; top: -3px; height: 14px; border-left: 1px dashed var(--axis); }
+tr.detail > td { background: var(--surface-2); cursor: default; }
+.perf-detail { display: grid; gap: 10px; }
+.kvline { display: flex; flex-wrap: wrap; gap: 4px 18px; font-size: 12.5px; }
+.flist { display: grid; gap: 8px; }
+.fitem { display: grid; grid-template-columns: 96px 1fr; gap: 10px; font-size: 13.5px; }
+.fitem .pill { justify-self: start; }
+.params { display: grid; gap: 10px; border-top: 1px solid var(--grid); }
+.pgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px 14px; max-height: 260px; overflow: auto; padding: 2px; }
+.vals { display: flex; flex-wrap: wrap; gap: 2px 10px; font-size: 11.5px; color: var(--ink-2); margin-top: 2px; }
+.vals i { font-style: normal; color: var(--muted); font-family: system-ui, sans-serif; font-size: 10.5px; margin-left: 3px; }
+
+/* my work page */
+.work-grid { display: grid; grid-template-columns: minmax(340px, 38%) 1fr; gap: 16px; align-items: start; margin-top: 16px; }
+@media (max-width: 1000px) { .work-grid { grid-template-columns: 1fr; } }
+#detail { position: sticky; top: 64px; max-height: calc(100vh - 80px); overflow: auto; }
+.wlist { max-height: calc(100vh - 300px); overflow: auto; }
+.wgroup { position: sticky; top: 0; z-index: 1; background: var(--surface-2); padding: 6px 14px; font-size: 11.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); border-bottom: 1px solid var(--grid); }
+.witem { padding: 10px 14px; border-bottom: 1px solid var(--grid); cursor: pointer; display: grid; gap: 4px; }
+.witem:hover { background: var(--accent-wash); }
+.witem.sel { background: var(--accent-wash); box-shadow: inset 3px 0 0 var(--accent); }
+.witem-h { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.witem-t { font-size: 13.5px; font-weight: 550; }
+.wsec { display: grid; gap: 8px; }
+.wph { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+pre.wtext { white-space: pre-wrap; word-break: break-word; font: 13px/1.5 system-ui, sans-serif; max-height: 320px; }
+.wcomment { display: grid; gap: 4px; }
+.gitrows { display: grid; gap: 8px; }
+.gitrow { display: grid; grid-template-columns: 110px 1fr auto; gap: 4px 10px; align-items: start; font-size: 13px; }
+.gitrow .pill { justify-self: start; }
+.gitdiff .diff { max-height: 480px; overflow: auto; }
+.dl.hunk { color: var(--accent); font-weight: 600; }

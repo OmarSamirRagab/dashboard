@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NDC · Performance</title>
+<script>document.documentElement.dataset.theme = localStorage.getItem('nb-theme') || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');</script>
+<link rel="stylesheet" href="/app.css">
+<link rel="stylesheet" href="/crm.css">
+</head>
+<body>
+<header class="bar">
+  <div class="brand"><div class="logo">NB</div>NDC · Not Booked Investigation</div>
+  <nav class="tabs"><a href="/">Cases</a><a href="/failures">Booking failures</a><a href="/exceptions">Exceptions</a><a href="/performance" aria-current="page">Performance</a><a href="/work">My work</a></nav>
+  <div class="sp"></div>
+  <span class="muted" style="font-size:12.5px">Odeysys backend · local WildFly only</span>
+  <button class="iconbtn" id="themeBtn" title="Toggle light / dark"></button>
+</header>
+
+<main>
+  <section class="card">
+    <div class="card-h"><h2>Endpoints</h2><span class="muted" id="epCount" style="font-size:12.5px">Reading controllers from the source…</span>
+      <div style="flex:1"></div><button class="iconbtn" type="button" id="rescan" title="Read the controllers again (after a git fetch or editing perf.endpoints.json)">↻ Rescan</button></div>
+    <div class="card-b" id="targets" style="display:grid;gap:4px;font-size:13px;padding-bottom:0"></div>
+    <form id="f" class="card-b" autocomplete="off" style="display:flex;gap:14px;align-items:end;flex-wrap:wrap">
+      <div class="field"><span>App</span>
+        <div class="seg" id="appSeg"><button type="button" data-v="" aria-pressed="true">All</button><button type="button" data-v="admin">Admin</button><button type="button" data-v="portal">Portal</button></div></div>
+      <div class="field"><span>Show</span>
+        <div class="seg" id="showSeg"><button type="button" data-v="run" aria-pressed="true">Runnable</button><button type="button" data-v="input">Needs values</button><button type="button" data-v="skip">Not called</button><button type="button" data-v="all">All</button></div></div>
+      <label class="field"><span>Filter</span><input type="text" id="q" placeholder="airline, /v2/lookup, AirlineControllerV2"></label>
+      <label class="field"><span>Calls each</span><input type="number" id="iter" min="1" max="10" value="3" style="width:70px"></label>
+      <label class="field"><span>In parallel</span><input type="number" id="conc" min="1" max="4" value="1" style="width:70px"></label>
+      <label class="field"><span>Target (s)</span><input type="number" id="warn" min="0.1" step="0.1" value="1" style="width:70px"></label>
+      <label class="field"><span>Limit (s)</span><input type="number" id="crit" min="0.2" step="0.1" value="5" style="width:70px"></label>
+      <button class="primary" id="go" type="submit"><span id="goTxt">Run</span></button>
+      <button class="iconbtn" type="button" id="stop" hidden>■ Stop</button>
+    </form>
+    <div class="card-b hint" style="padding-top:0">Only <b>read-only GET</b> endpoints are called automatically. GETs whose name sounds like a change (delete, save, cancel, book…)
+      and every POST/PUT/DELETE are skipped unless you list them in <span class="mono">perf.endpoints.json</span> with test data. Each endpoint gets one first call
+      (shown as <i>first call</i>), then <i>Calls each</i> timed calls. <b>Typical</b> is the median of the timed calls.</div>
+    <div id="progress" class="card-b" style="padding-top:0" hidden></div>
+    <div id="err" class="err card-b" style="padding-top:0" hidden></div>
+    <div id="list"></div>
+  </section>
+
+  <div id="out" style="display:grid;gap:16px"></div>
+</main>
+<div class="tip" id="tip"></div>
+<div class="toast" id="toast"></div>
+
+<script src="/common.js"></script>
+<script src="/crm-ui.js"></script>
+<script>
+const SEV = { critical: { c: 'var(--critical)', i: '✕', label: 'Critical' }, warning: { c: 'var(--warning)', i: '!', label: 'Warning', dark: true },
+  info: { c: 'var(--neutral)', i: 'i', label: 'Hint' }, good: { c: 'var(--good)', i: '✓', label: 'OK' } };
+const sevPill = (s, text) => { const k = SEV[s]; return el('span', { className: 'pill', style: { '--c': k.c } }, el('span', { className: 'ico' + (k.dark ? ' dark-ink' : ''), textContent: k.i, 'aria-hidden': 'true' }), text || k.label); };
+const ms = (v) => v == null ? '—' : v < 1000 ? `${v} ms` : `${(v / 1000).toFixed(v < 10000 ? 2 : 1)} s`;
+const kb = (b) => b == null ? '—' : b < 1024 ? `${b} B` : b < 1048576 ? `${Math.round(b / 1024)} KB` : `${(b / 1048576).toFixed(1)} MB`;
+const th = () => ({ warn: Math.round(+$('#warn').value * 1000) || 1000, crit: Math.round(+$('#crit').value * 1000) || 5000 });
+const sevOf = (r) => r.error || r.status >= 500 ? 'critical' : r.status >= 300 ? 'warning' : r.median >= th().crit ? 'critical' : r.median >= th().warn ? 'warning' : 'good';
+const verb = (v) => el('span', { className: 'verb mono', 'data-v': v }, v);
+
+let eps = null, rep = null; const sel = new Set(); const ui = { app: '', show: 'run', limit: 150, open: new Set(), source: 'current' };
+const seg = (id, key, after) => $(id).onclick = (e) => { const v = e.target.dataset.v; if (v === undefined) return; ui[key] = v;
+  $(id).querySelectorAll('button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.v === v))); after(); };
+seg('#appSeg', 'app', () => { ui.limit = 150; renderList(); }); seg('#showSeg', 'show', () => { ui.limit = 150; renderList(); });
+$('#q').oninput = () => { ui.limit = 150; renderList(); };
+for (const id of ['#warn', '#crit']) $(id).onchange = () => loadReport(ui.source);
+
+/* ---------------- endpoint list ---------------- */
+async function loadEndpoints(refresh) {
+  $('#epCount').textContent = 'Reading controllers from the source…';
+  try {
+    eps = await api('/api/perf/endpoints' + (refresh ? '?refresh=1' : ''));
+    sel.clear(); eps.endpoints.filter(e => e.status.run).forEach(e => sel.add(e.id));
+    renderTargets(); renderList();
+  } catch (e) { $('#epCount').textContent = ''; showErr(e.message); }
+}
+$('#rescan').onclick = () => loadEndpoints(true);
+
+function renderTargets() {
+  const t = eps.apps.map(a => el('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } },
+    el('b', { style: { minWidth: '52px' } }, a.key), el('span', { className: 'mono' }, a.baseUrl + (a.prefix || '')), copyBtn(a.baseUrl + (a.prefix || '')),
+    a.local || eps.allowRemote ? null : sevPill('critical', 'not local – runs are refused'),
+    el('span', { className: 'muted' }, `${a.controllers} controllers · dispatcher ${a.pattern || '/'}${a.note ? ' · ' + a.note : ''}`),
+    eps.login[a.key] ? sevPill('good', 'login configured') : sevPill('warning', 'no login in perf.endpoints.json')));
+  const db = eps.db || {};
+  const fillBtn = el('button', { type: 'button', className: 'iconbtn', disabled: !db.configured, title: 'Read the schema and one sample value per needed column (SELECT … LIMIT 1, read-only session)' }, '⛁ Fill values from DB');
+  fillBtn.onclick = fillFromDb;
+  t.push(el('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } }, el('b', { style: { minWidth: '52px' } }, 'db'),
+    db.configured ? el('span', { className: 'mono' }, db.db) : sevPill('warning', 'not configured – start.ps1 -Perf asks for the MySQL schema and a read-only user'),
+    db.columns ? el('span', { className: 'muted' }, `${db.columns.toLocaleString()} columns · ${db.values.toLocaleString()} sample values${db.at ? ' · ' + fmtDate(db.at) : ''}${db.missing ? ` · ${db.missing} not looked up yet` : ''}`) : null,
+    fillBtn));
+  t.push(el('div', { className: 'muted', style: { fontSize: '12.5px' } }, `Source: ${eps.ref} (git). Base URLs: PERF_ADMIN_URL / PERF_PORTAL_URL. `,
+    eps.configFound ? `Config: ${eps.configFile}` : `No ${eps.configFile} yet – copy perf.endpoints.example.json to add login, sample values and POST endpoints.`));
+  $('#targets').replaceChildren(...t);
+}
+
+const group = (e) => e.status.run ? 'run' : e.status.missing ? 'input' : 'skip';
+function filtered() {
+  const q = $('#q').value.trim().toLowerCase();
+  return eps.endpoints.filter(e => (!ui.app || e.app === ui.app) && (ui.show === 'all' || group(e) === ui.show)
+    && (!q || `${e.fullPath} ${e.className || ''}.${e.methodName || ''} ${e.name || ''}`.toLowerCase().includes(q)));
+}
+function renderList() {
+  const all = eps.endpoints, rows = filtered();
+  const n = (g) => all.filter(e => (!ui.app || e.app === ui.app) && group(e) === g).length;
+  $('#epCount').textContent = `${all.filter(e => e.source === 'code').length} REST mappings · ${n('run')} runnable · ${n('input')} need sample values · ${n('skip')} not called`;
+  const runnableShown = rows.filter(e => e.status.run);
+  const chosen = runnableShown.filter(e => sel.has(e.id)).length;
+  $('#goTxt').textContent = chosen ? `Run ${chosen} endpoint${chosen > 1 ? 's' : ''}` : 'Run';
+  const head = el('input', { type: 'checkbox', checked: runnableShown.length > 0 && chosen === runnableShown.length, title: 'Select all shown', disabled: !runnableShown.length });
+  head.indeterminate = chosen > 0 && chosen < runnableShown.length;
+  head.onchange = () => { runnableShown.forEach(e => head.checked ? sel.add(e.id) : sel.delete(e.id)); renderList(); };
+  const tb = el('tbody', {}, rows.slice(0, ui.limit).map(e => {
+    const cb = el('input', { type: 'checkbox', checked: sel.has(e.id), disabled: !e.status.run });
+    cb.onchange = () => { cb.checked ? sel.add(e.id) : sel.delete(e.id); renderList(); };
+    return el('tr', {}, el('td', {}, cb), el('td', {}, verb(e.verb)),
+      el('td', { className: 'mono', style: { fontSize: '12.5px', wordBreak: 'break-all' } }, e.name ? el('b', { style: { fontFamily: 'system-ui' } }, e.name + ' ') : null, e.fullPath),
+      el('td', { className: 'ink2', style: { fontSize: '12.5px' } }, e.app, e.className ? el('div', { className: 'muted mono', style: { fontSize: '11.5px' } }, `${e.className}.${e.methodName}()`) : null),
+      el('td', { style: { fontSize: '12.5px' } }, e.status.run ? el('span', { className: 'muted' }, e.status.why) : el('span', { className: 'ink2' }, e.status.why), valuesLine(e)));
+  }));
+  const more = rows.length > ui.limit ? el('button', { type: 'button', className: 'iconbtn', onclick: () => { ui.limit += 300; renderList(); } }, `Show more (${rows.length - ui.limit} left)`) : null;
+  $('#list').replaceChildren(ui.show === 'input' || ui.show === 'all' ? paramsPanel() : null, el('div', { className: 'eplist' }, el('table', { className: 'tbl' },
+    el('thead', {}, el('tr', {}, el('th', {}, head), ...['Method', 'Path', 'App · handler', 'Called?'].map(h => el('th', { textContent: h })))), tb)),
+    el('div', { className: 'card-b', style: { display: 'flex', gap: '12px', alignItems: 'center' } }, more, el('span', { className: 'muted' }, `${rows.length} shown`),
+      ui.show === 'input' ? el('span', { className: 'muted', style: { fontSize: '12.5px' } }, 'Enter sample values above and press Save – the endpoints become runnable.') : null));
+}
+
+/* the values an endpoint will be called with, and where each comes from */
+const SRC = { manual: 'typed', db: 'db', generated: 'auto' };
+function valuesLine(e) {
+  const v = { ...(e.values || {}), ...(e.bodyValues || {}) }; const keys = Object.keys(v);
+  if (!keys.length && !e.body) return null;
+  const line = el('div', { className: 'vals mono' }, keys.map(k => el('span', { title: v[k].col ? `from ${v[k].col}` : SRC[v[k].src] }, `${k}=${v[k].v}`, el('i', {}, SRC[v[k].src]))));
+  if (e.body && e.source === 'code') line.append(el('span', { title: JSON.stringify(e.body, null, 2) }, `body ${e.bodyType || ''} {${Object.keys(e.body).length} fields}`, el('i', {}, 'hover')));
+  return line;
+}
+async function fillFromDb(ev) {
+  const b = ev.currentTarget; b.disabled = true; b.textContent = 'Reading the DB…'; hideErr();
+  try {
+    const before = new Set(eps.endpoints.filter(e => e.status.run).map(e => e.id));
+    eps = await api('/api/perf/dbfill', {});
+    const added = eps.endpoints.filter(e => e.status.run && !before.has(e.id)); added.forEach(e => sel.add(e.id));
+    toast(`DB: ${eps.fill.looked} columns read${eps.fill.failed ? `, ${eps.fill.failed} failed` : ''} · ${added.length} more endpoint${added.length === 1 ? '' : 's'} can be called`);
+    renderTargets(); renderList();
+  } catch (e) { showErr(e.message); b.disabled = false; b.textContent = '⛁ Fill values from DB'; }
+}
+
+/* sample values for {path variables} and required request params, shared by name (one "id" serves every endpoint that needs an id) */
+const draft = {};
+function paramsPanel() {
+  const need = new Map();
+  for (const e of eps.endpoints) if (!ui.app || e.app === ui.app) for (const n of (e.status.missing || [])) need.set(n, (need.get(n) || 0) + 1);
+  const saved = eps.params || {};
+  const names = [...new Set([...[...need.entries()].sort((a, b) => b[1] - a[1]).map(([n]) => n), ...Object.keys(saved).sort()])];
+  if (!names.length) return null;
+  const save = el('button', { type: 'button', className: 'primary' }, 'Save values');
+  save.onclick = async () => {
+    const before = new Set(eps.endpoints.filter(e => e.status.run).map(e => e.id));
+    save.disabled = true;
+    try {
+      eps = await api('/api/perf/params', { params: { ...draft } });
+      const added = eps.endpoints.filter(e => e.status.run && !before.has(e.id));
+      added.forEach(e => sel.add(e.id)); for (const k of Object.keys(draft)) delete draft[k];
+      toast(added.length ? `${added.length} more endpoint${added.length > 1 ? 's' : ''} can be called now` : 'Saved');
+      renderTargets(); renderList();
+    } catch (e) { toast('⚠ ' + e.message); save.disabled = false; }
+  };
+  return el('div', { className: 'card-b params' },
+    el('div', { style: { display: 'flex', gap: '10px', alignItems: 'baseline', flexWrap: 'wrap' } }, el('b', {}, 'Sample values'),
+      el('span', { className: 'muted', style: { fontSize: '12.5px' } }, 'Filled into {path variables} and required parameters by name. Use test data – saved in perf.endpoints.json. Clear a box to remove the value.')),
+    el('div', { className: 'pgrid' }, names.map(n => {
+      const inp = el('input', { type: 'text', value: draft[n] ?? saved[n] ?? '', placeholder: need.has(n) ? 'needed' : '' });
+      inp.oninput = () => { draft[n] = inp.value; };
+      inp.onkeydown = (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); draft[n] = inp.value; save.click(); } };
+      return el('label', { className: 'field' }, el('span', {}, el('span', { className: 'mono' }, n), ' ',
+        el('span', { className: 'muted', style: { fontWeight: 400 } }, need.has(n) ? `· ${need.get(n)} endpoint${need.get(n) > 1 ? 's' : ''}` : saved[n] !== undefined ? '· saved' : '')), inp);
+    })),
+    el('div', {}, save));
+}
+
+/* ---------------- run ---------------- */
+$('#f').addEventListener('submit', async (e) => {
+  e.preventDefault(); hideErr();
+  const ids = filtered().filter(x => x.status.run && sel.has(x.id)).map(x => x.id);
+  if (!ids.length) { toast('Select at least one runnable endpoint'); return; }
+  try { await api('/api/perf/run', { ids, iterations: +$('#iter').value, concurrency: +$('#conc').value }); ui.open.clear(); poll(); }
+  catch (err) { showErr(err.message); }
+});
+$('#stop').onclick = async () => { await api('/api/perf/stop', {}); toast('Stopping after the current calls…'); };
+
+let polling = null;
+async function poll() {
+  clearTimeout(polling);
+  const s = await api('/api/perf/status').catch(() => null);
+  const running = s && s.state === 'running';
+  $('#go').disabled = running; $('#stop').hidden = !running;
+  if (s && s.state !== 'idle') {
+    const pctDone = s.total ? Math.round(s.done / s.total * 100) : 0;
+    $('#progress').hidden = false;
+    $('#progress').replaceChildren(el('div', { style: { display: 'flex', gap: '10px', alignItems: 'center', fontSize: '13px' } },
+      running ? el('span', { className: 'spinner dark' }) : null,
+      el('b', {}, running ? `Running ${s.done} / ${s.total}` : `${s.state === 'stopped' ? 'Stopped' : s.state === 'error' ? 'Failed' : 'Finished'}: ${s.done} / ${s.total} endpoints`),
+      el('span', { className: 'muted' }, `${s.opts.iterations} calls each · ${s.opts.concurrency} in parallel · started ${fmtTime(s.started).slice(0, 8)}`),
+      ...Object.entries(s.logins || {}).map(([k, l]) => !l.configured ? null : l.ok ? sevPill('good', `${k} login ${ms(l.ms)}`) : sevPill('critical', `${k} login failed: ${l.error}`)),
+      s.error ? el('span', { className: 'err' }, s.error) : null),
+      el('div', { className: 'progress' }, el('div', { style: { width: pctDone + '%' } })));
+  }
+  if (s && s.state !== 'idle') await loadReport('current');
+  if (running) polling = setTimeout(poll, 1500);
+}
+
+/* ---------------- results ---------------- */
+async function loadReport(source) {
+  ui.source = source;
+  try { rep = await api(`/api/perf/report?run=${source}&warn=${th().warn}&crit=${th().crit}`); renderReport(); }
+  catch (e) { showErr(e.message); }
+}
+
+function renderReport() {
+  if (!rep || !rep.run) { $('#out').replaceChildren(el('section', { className: 'card' }, el('div', { className: 'empty' },
+    el('div', { className: 'big' }, 'No results yet'), 'Pick endpoints above and press Run. Start WildFly locally first.'))); return; }
+  const rows = [...rep.rows].sort((a, b) => (b.median ?? -1) - (a.median ?? -1));
+  const ok = rows.filter(r => !r.error && r.status < 300 && r.median != null);
+  const T = th(); const crit = ok.filter(r => r.median >= T.crit), warn = ok.filter(r => r.median >= T.warn && r.median < T.crit);
+  const failed = rows.filter(r => r.error || r.status >= 300);
+  const epOf = (id) => (eps && eps.endpoints.find(e => e.id === id)) || { id, verb: id.split(' ')[1], fullPath: id.split(' ').slice(2).join(' '), app: id.split(' ')[0] };
+  const label = (r) => { const e = epOf(r.id); return e.name || e.fullPath; };
+  const out = [];
+  out.push(el('section', { className: 'card' },
+    el('div', { className: 'card-h' }, el('h2', {}, 'Results'),
+      el('span', { className: 'muted', style: { fontSize: '12.5px' } }, `${rep.run.state === 'running' ? 'running · ' : ''}${fmtDate(rep.run.started)} · ${rep.run.opts.iterations} calls each${rep.baselineAt ? ` · compared with baseline of ${fmtDate(rep.baselineAt)}` : ''}`),
+      el('div', { style: { flex: 1 } }),
+      el('button', { className: 'iconbtn', type: 'button', disabled: rep.run.state === 'running', title: 'Keep this run to compare later runs with it (e.g. before and after a fix)', onclick: saveBaseline }, '⚑ Save as baseline'),
+      el('button', { className: 'iconbtn', type: 'button', onclick: () => exportCsv(rows, epOf) }, '⤓ Export CSV')),
+    el('div', { className: 'card-b' },
+      el('div', { className: 'tiles' },
+        tile('Endpoints tested', rows.length.toLocaleString(), null, `${ok.length} answered 2xx`),
+        tile('Slowest', ok[0] ? ms(ok[0].median) : '—', ok[0] ? `var(--${sevOf(ok[0]) === 'good' ? 'good' : sevOf(ok[0])})` : null, ok[0] ? label(ok[0]) : ''),
+        tile(`Over ${T.crit / 1000} s`, crit.length.toLocaleString(), 'var(--critical)', 'typical time'),
+        tile(`${T.warn / 1000}–${T.crit / 1000} s`, warn.length.toLocaleString(), 'var(--warning)', 'typical time'),
+        tile('Failed / not logged in', failed.length.toLocaleString(), failed.length ? 'var(--serious)' : null, 'errors, timeouts, 3xx/4xx'),
+        tile('Median endpoint', ok.length ? ms(ok.map(r => r.median).sort((a, b) => a - b)[ok.length >> 1]) : '—')),
+      ok.length ? el('div', { style: { marginTop: '16px' } }, slowChart(ok.slice(0, 20), label, T)) : null)));
+  out.push(fixesCard(rows, label));
+  out.push(resultsTable(rows, epOf, label));
+  $('#out').replaceChildren(...out.filter(Boolean));
+}
+
+function tile(lab, value, color, sub) {
+  return el('div', { className: 'tile static', style: color ? { '--c': color } : {} }, el('div', { className: 'lab' }, lab),
+    el('div', { className: 'val num', style: { fontSize: String(value).length > 14 ? '15px' : '26px' } }, value),
+    sub ? el('div', { className: 'muted', style: { fontSize: '12px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: sub }, sub) : null);
+}
+
+/* slowest endpoints: one series (typical time), bar colour = status against the target/limit, with icon in the value */
+function slowChart(rows, label, T) {
+  const max = Math.max(T.crit, ...rows.map(r => Math.max(r.median, r.cold || 0)));
+  const x = (v) => (v / max * 100) + '%';
+  return el('div', {},
+    el('div', { className: 'muted', style: { fontSize: '12.5px', marginBottom: '8px' } }, `Slowest ${rows.length} endpoints – typical time; │ = first call; dashed lines = target ${T.warn / 1000} s and limit ${T.crit / 1000} s`),
+    el('div', { className: 'barlist' }, rows.map(r => { const s = sevOf(r);
+      const row = el('div', { className: 'bl-row click', title: '' },
+        el('div', { className: 'bl-lab' }, label(r)),
+        el('div', { className: 'bl-track', style: { position: 'relative' } },
+          el('div', { className: 'bl-bar', style: { width: x(r.median), background: SEV[s].c } }),
+          r.cold != null && r.cold > r.median ? el('div', { className: 'bl-cold', style: { left: x(r.cold) } }) : null,
+          el('div', { className: 'bl-th', style: { left: x(T.warn) } }), el('div', { className: 'bl-th', style: { left: x(T.crit) } })),
+        el('div', { className: 'bl-val num' }, `${SEV[s].i} ${ms(r.median)}`));
+      hoverTip(row, () => [el('b', {}, label(r)), el('div', {}, `typical ${ms(r.median)} · first call ${ms(r.cold)}`), el('div', {}, `fastest ${ms(r.min)} · slowest ${ms(r.max)}`),
+        el('div', {}, `${kb(r.bytes)}${r.items ? ` · ${r.items.toLocaleString()} rows` : ''}${r.encoding ? ' · ' + r.encoding : ''}`)]);
+      row.onclick = () => openRow(r.id); return row; })));
+}
+
+/* fixes grouped by rule, ranked by severity, then by time over the target they explain */
+function fixesCard(rows, label) {
+  const T = th(); const g = new Map();
+  for (const r of rows) for (const f of r.findings) {
+    if (f.rule === 'slow') continue;
+    const k = f.rule; if (!g.has(k)) g.set(k, { ...f, eps: new Map(), excess: 0 });
+    const x = g.get(k); if (!x.eps.has(r.id)) { x.eps.set(r.id, []); x.excess += Math.max(0, (r.median || 0) - T.warn); }
+    x.eps.get(r.id).push(f); if (f.sev === 'critical') x.sev = 'critical';
+  }
+  const rank = { critical: 0, warning: 1, info: 2 };
+  const items = [...g.values()].sort((a, b) => rank[a.sev] - rank[b.sev] || b.excess - a.excess);
+  if (!items.length) return null;
+  const analysed = rows.some(r => r.findings.some(f => f.kind === 'code'));
+  return el('section', { className: 'card' },
+    el('div', { className: 'card-h' }, el('h2', {}, 'Suggested fixes'),
+      el('span', { className: 'muted', style: { fontSize: '12.5px' } }, analysed ? `Measured problems, plus code patterns found in the handler and the service/DAO methods it calls (for endpoints over ${T.warn / 1000} s). Code patterns are likely causes, not proof – profile to confirm.` : 'From the measurements. Code analysis runs when the run finishes.')),
+    el('div', {}, items.map(x => el('div', { className: 'loc' },
+      el('div', { className: 'loc-main' }, sevPill(x.sev), el('b', {}, x.kind === 'code' ? x.title : x.title.replace(/:.*/, '')),
+        el('span', { className: 'chip', style: { fontFamily: 'inherit' } }, x.kind === 'code' ? 'code pattern' : 'measured'),
+        el('span', { className: 'muted' }, `${x.eps.size} endpoint${x.eps.size > 1 ? 's' : ''}${x.excess ? ` · ${ms(Math.round(x.excess))} over target in total` : ''}`)),
+      el('div', { className: 'ink2', style: { fontSize: '13.5px' } }, x.fix || x.detail),
+      el('div', { className: 'loc-chg' }, [...x.eps.keys()].slice(0, 8).map(id => { const r = rows.find(y => y.id === id);
+        return el('button', { type: 'button', className: 'linkbtn', onclick: () => openRow(id) }, `${label(r)} (${ms(r.median)})`); }),
+        x.eps.size > 8 ? el('span', { className: 'muted' }, `+${x.eps.size - 8} more`) : null)))));
+}
+
+function resultsTable(rows, epOf, label) {
+  const tb = el('tbody');
+  for (const r of rows) {
+    const e = epOf(r.id); const s = sevOf(r);
+    const n = { critical: 0, warning: 0, info: 0 }; r.findings.filter(f => f.rule !== 'slow').forEach(f => n[f.sev]++);
+    const delta = r.baseline != null && r.median != null ? r.median - r.baseline : null;
+    const tr = el('tr', { className: 'case', id: 'r-' + cssId(r.id) },
+      el('td', {}, verb(e.verb)),
+      el('td', {}, el('div', { className: 'mono', style: { fontSize: '12.5px', wordBreak: 'break-all' } }, label(r)),
+        e.className ? el('div', { className: 'muted mono', style: { fontSize: '11.5px' } }, `${e.app} · ${e.className}.${e.methodName}()`) : el('div', { className: 'muted', style: { fontSize: '11.5px' } }, e.app)),
+      el('td', {}, r.error ? sevPill('critical', r.error.length > 28 ? 'failed' : r.error) : sevPill(s === 'good' ? 'good' : s, String(r.status))),
+      el('td', { className: 'num' }, ms(r.cold)),
+      el('td', { className: 'num', style: { fontWeight: 700 } }, ms(r.median)),
+      el('td', { className: 'num' }, ms(r.max)),
+      el('td', { className: 'num' }, delta == null ? '—' : el('span', { style: { color: delta > 0.1 * r.baseline && delta > 100 ? 'var(--critical-text)' : delta < -0.1 * r.baseline && delta < -100 ? 'var(--good-text)' : 'var(--ink-2)' } }, `${delta > 0 ? '+' : delta < 0 ? '−' : ''}${ms(Math.abs(delta))}`)),
+      el('td', { className: 'num' }, kb(r.bytes), r.items ? el('div', { className: 'muted', style: { fontSize: '11.5px' } }, `${r.items.toLocaleString()} rows`) : null),
+      el('td', {}, el('span', { className: 'chips' }, n.critical ? sevPill('critical', String(n.critical)) : null, n.warning ? sevPill('warning', String(n.warning)) : null, n.info ? sevPill('info', String(n.info)) : null)));
+    const detail = el('tr', { className: 'detail', hidden: !ui.open.has(r.id) }, el('td', { colSpan: 9 }));
+    const fill = () => detail.firstChild.replaceChildren(rowDetail(r, e));
+    tr.onclick = () => { if (ui.open.has(r.id)) { ui.open.delete(r.id); detail.hidden = true; } else { ui.open.add(r.id); fill(); detail.hidden = false; } };
+    if (ui.open.has(r.id)) fill();
+    tb.append(tr, detail);
+  }
+  return el('section', { className: 'card' },
+    el('div', { className: 'card-h' }, el('h2', {}, 'All endpoints'), el('span', { className: 'muted', style: { fontSize: '12.5px' } }, 'slowest first · click a row for timings, fixes and code')),
+    el('table', { className: 'tbl' }, el('thead', {}, el('tr', {}, ['', 'Endpoint', 'Status', 'First call', 'Typical', 'Slowest', 'vs baseline', 'Size', 'Fixes'].map(h => el('th', { textContent: h })))), tb));
+}
+const cssId = (id) => id.replace(/[^\w-]/g, '_');
+function openRow(id) {
+  ui.open.add(id); renderReport();
+  const tr = document.getElementById('r-' + cssId(id)); if (tr) { tr.scrollIntoView({ behavior: 'smooth', block: 'center' }); tr.classList.add('sel'); setTimeout(() => tr.classList.remove('sel'), 1600); }
+}
+
+function rowDetail(r, e) {
+  const box = el('div', { className: 'perf-detail' });
+  box.append(el('div', { className: 'kvline' },
+    el('span', {}, el('span', { className: 'muted' }, 'URL '), el('span', { className: 'mono' }, r.url), copyBtn(r.url)),
+    el('span', {}, el('span', { className: 'muted' }, 'timed calls '), el('span', { className: 'num' }, r.runs.length ? r.runs.map(ms).join(' · ') : '—')),
+    el('span', {}, el('span', { className: 'muted' }, 'first byte '), ms(r.ttfb)),
+    el('span', {}, el('span', { className: 'muted' }, 'type '), `${r.type || '—'}${r.encoding ? ' · ' + r.encoding : ' · not compressed'}`),
+    r.location ? el('span', {}, el('span', { className: 'muted' }, 'redirect → '), el('span', { className: 'mono' }, r.location)) : null));
+  if (r.sent) box.append(el('div', {}, el('div', { className: 'muted', style: { fontSize: '12px' } }, 'Request body sent ', copyBtn(r.sent)), el('pre', {}, pretty(r.sent))));
+  const list = el('div', { className: 'flist' }); box.append(list);
+  const show = (fs) => list.replaceChildren(...(fs.length ? fs : [{ sev: 'good', title: 'No problems found', detail: 'Within the target and no known slow code patterns.', kind: 'measured' }]).map(f =>
+    el('div', { className: 'fitem' }, el('div', {}, sevPill(f.sev)),
+      el('div', {}, el('div', {}, el('b', {}, f.title), ' ', el('span', { className: 'chip', style: { fontFamily: 'inherit' } }, f.kind === 'code' ? 'code pattern' : 'measured')),
+        el('div', { className: 'ink2', style: { fontSize: '13px' } }, f.fix || f.detail),
+        f.where ? el('div', { className: 'mono', style: { fontSize: '12px', marginTop: '4px' } }, el('span', { className: 'muted' }, `${f.where.method}() · ${f.where.path.split('/').pop()}:${f.where.line}  `),
+          el('span', {}, f.where.code), ' ', ideLink(f.where.path, f.where.line),
+          f.via ? el('div', { className: 'muted' }, `reached from ${f.via.method}() line ${f.via.line}`) : null) : null))));
+  show(r.findings);
+  if (e.file && !r.findings.some(f => f.kind === 'code')) {
+    const b = el('button', { type: 'button', className: 'iconbtn fixbtn' }, '💡 Check the code');
+    b.onclick = async (ev) => { ev.stopPropagation(); b.disabled = true; b.textContent = 'Analysing…';
+      try { const a = await api('/api/perf/analyze?id=' + encodeURIComponent(r.id)); r.findings = [...r.findings, ...a.findings]; show(r.findings); b.remove(); if (!a.findings.length) toast('No known slow patterns in this handler'); }
+      catch (err) { toast('⚠ ' + err.message); b.disabled = false; b.textContent = '💡 Check the code'; } };
+    box.append(el('div', {}, b));
+  }
+  if (e.file) box.append(el('div', { className: 'muted', style: { fontSize: '12px' } }, 'Handler: ', el('span', { className: 'mono' }, `${e.file}:${e.line}`), ' ', ideLink(e.file, e.line)));
+  box.onclick = (ev) => ev.stopPropagation();
+  return box;
+}
+function ideLink(p, line) {
+  const b = el('button', { type: 'button', className: 'linkbtn', title: 'Open in IntelliJ (your working copy)' }, el('span', { className: 'ij' }, 'IJ'), ' open');
+  b.onclick = async (ev) => { ev.stopPropagation(); try { const r = await api('/api/open-ide', { path: p, line }); toast(`Opened via ${r.via}${r.shifted ? ` (line moved ${r.shifted > 0 ? '+' : ''}${r.shifted})` : ''}`); } catch (e) { toast('⚠ ' + e.message); } };
+  return b;
+}
+
+async function saveBaseline() {
+  try { await api('/api/perf/baseline', {}); toast('Saved as baseline – later runs show the difference'); loadReport(ui.source); } catch (e) { toast('⚠ ' + e.message); }
+}
+function exportCsv(rows, epOf) {
+  const q = (v) => '"' + String(v ?? '').replace(/"/g, '""') + '"';
+  const head = ['app', 'method', 'path', 'handler', 'status', 'error', 'first_call_ms', 'typical_ms', 'slowest_ms', 'baseline_ms', 'bytes', 'rows', 'compressed', 'findings'];
+  const lines = [head.join(','), ...rows.map(r => { const e = epOf(r.id); return [e.app, e.verb, e.fullPath, e.className ? `${e.className}.${e.methodName}` : '', r.status, r.error, r.cold, r.median, r.max, r.baseline,
+    r.bytes, r.items, r.encoding || 'no', r.findings.filter(f => f.rule !== 'slow').map(f => `${f.sev}: ${f.title}`).join(' | ')].map(q).join(','); })];
+  const a = el('a', { href: URL.createObjectURL(new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv' })), download: `odeysys-performance-${new Date().toISOString().slice(0, 16).replace('T', '_').replace(':', '')}.csv` });
+  a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+
+const showErr = (m) => { $('#err').hidden = false; $('#err').textContent = '⚠ ' + m; };
+const hideErr = () => { $('#err').hidden = true; };
+
+/* init: endpoints, then the running or last finished run */
+loadEndpoints().then(poll).then(() => { if (!rep || !rep.run) loadReport('last'); });
+</script>
+</body>
+</html>

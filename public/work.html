@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NDC · My work</title>
+<script>document.documentElement.dataset.theme = localStorage.getItem('nb-theme') || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');</script>
+<link rel="stylesheet" href="/app.css">
+<link rel="stylesheet" href="/crm.css">
+</head>
+<body>
+<header class="bar">
+  <div class="brand"><div class="logo">NB</div>NDC · Not Booked Investigation</div>
+  <nav class="tabs"><a href="/">Cases</a><a href="/failures">Booking failures</a><a href="/exceptions">Exceptions</a><a href="/performance">Performance</a><a href="/work" aria-current="page">My work</a></nav>
+  <div class="sp"></div>
+  <span class="muted" style="font-size:12.5px" id="src">Azure DevOps · read-only</span>
+  <button class="iconbtn" id="themeBtn" title="Toggle light / dark"></button>
+</header>
+
+<main>
+  <section class="card">
+    <div class="card-h"><h2>My open work</h2><span class="muted" id="sub" style="font-size:12.5px">Loading from Azure DevOps…</span>
+      <div style="flex:1"></div>
+      <div class="seg" id="typeSeg"><button type="button" data-v="" aria-pressed="true">All</button><button type="button" data-v="Bug">Bugs</button><button type="button" data-v="Task">Tasks</button><button type="button" data-v="other">Other</button></div>
+      <input type="text" id="q" placeholder="Filter: id, title, tag" style="width:220px">
+      <button class="iconbtn" type="button" id="reload">↻ Refresh</button></div>
+    <div id="err" class="err card-b" hidden></div>
+    <div class="card-b" id="tiles"></div>
+  </section>
+  <div class="work-grid">
+    <section class="card" id="listCard"></section>
+    <section class="card" id="detail"><div class="empty"><div class="big">Pick a work item</div>Bugs show the fix in git and, when the bug has a stack trace, the code line with 💡 Suggest fix.</div></section>
+  </div>
+</main>
+<div class="tip" id="tip"></div>
+<div class="toast" id="toast"></div>
+
+<script src="/common.js"></script>
+<script src="/crm-ui.js"></script>
+<script src="/code.js"></script>
+<script>
+const TYPE = { Bug: { c: 'var(--critical)', i: '✕' }, Task: { c: 'var(--accent)', i: '✓' }, 'User Story': { c: 'var(--s3)', i: '◆' }, Feature: { c: 'var(--s5)', i: '★' } };
+const typePill = (t) => { const k = TYPE[t] || { c: 'var(--neutral)', i: '•' }; return el('span', { className: 'pill', style: { '--c': k.c } }, el('span', { className: 'ico', textContent: k.i, 'aria-hidden': 'true' }), t); };
+const STATE_ORDER = ['Active', 'In Progress', 'Committed', 'New', 'To Do', 'Approved', 'Resolved'];
+const stateRank = (s) => { const i = STATE_ORDER.indexOf(s); return i < 0 ? STATE_ORDER.length : i; };
+const ago = (iso) => { const h = (Date.now() - new Date(iso)) / 3600e3; return h < 1 ? `${Math.max(1, Math.round(h * 60))} min ago` : h < 48 ? `${Math.round(h)} h ago` : `${Math.round(h / 24)} days ago`; };
+let data = null; const ui = { type: '', sel: null };
+
+$('#typeSeg').onclick = (e) => { const v = e.target.dataset.v; if (v === undefined) return; ui.type = v;
+  $('#typeSeg').querySelectorAll('button').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.v === v))); renderList(); };
+$('#q').oninput = () => renderList();
+$('#reload').onclick = () => load();
+
+async function load() {
+  $('#err').hidden = true; $('#sub').textContent = 'Loading from Azure DevOps…';
+  try { data = await api('/api/work/items'); render(); }
+  catch (e) { $('#sub').textContent = ''; $('#err').hidden = false;
+    $('#err').replaceChildren('⚠ ' + e.message, e.message.includes('not configured') ? el('div', { className: 'muted', style: { marginTop: '6px' } },
+      'Start the dashboard with ', el('span', { className: 'mono' }, 'start.ps1 -Azure'), ' and a personal access token with Work Items (Read) and Code (Read).') : null); }
+}
+
+const inSprint = (w) => data.sprint && w.iteration === data.sprint.path;
+function render() {
+  $('#src').textContent = `${data.org.replace(/^https?:\/\//, '')} · ${data.project} · read-only`;
+  $('#sub').textContent = `${data.items.length} open item${data.items.length === 1 ? '' : 's'} assigned to you${data.sprint ? ` · sprint ${data.sprint.name}` : ''}`;
+  const bugs = data.items.filter(w => w.type === 'Bug');
+  const t = (lab, v, c, sub) => el('div', { className: 'tile static', style: c ? { '--c': c } : {} }, el('div', { className: 'lab' }, lab), el('div', { className: 'val num' }, String(v)), sub ? el('div', { className: 'muted', style: { fontSize: '12px' } }, sub) : null);
+  $('#tiles').replaceChildren(el('div', { className: 'tiles' },
+    t('Open bugs', bugs.length, 'var(--critical)', `${bugs.filter(w => w.state === 'Active' || w.state === 'In Progress').length} active`),
+    t('Tasks', data.items.filter(w => w.type === 'Task').length, 'var(--accent)', `${data.items.filter(w => w.type === 'Task').reduce((s, w) => s + (w.remaining || 0), 0)} h remaining`),
+    t('In current sprint', data.sprint ? data.items.filter(inSprint).length : '—', null, data.sprint ? data.sprint.name : 'sprint not found (set AZDO_TEAM)'),
+    t('Resolved, waiting', data.items.filter(w => w.state === 'Resolved').length, 'var(--good)', 'to be verified / closed')));
+  renderList();
+  const want = Number(new URLSearchParams(location.search).get('id'));
+  if (want && !ui.sel) openItem(want);
+}
+
+function renderList() {
+  if (!data) return;
+  const q = $('#q').value.trim().toLowerCase();
+  const rows = data.items.filter(w => (!ui.type || (ui.type === 'other' ? !['Bug', 'Task'].includes(w.type) : w.type === ui.type))
+    && (!q || `${w.id} ${w.title} ${w.tags}`.toLowerCase().includes(q)))
+    .sort((a, b) => (inSprint(b) - inSprint(a)) || stateRank(a.state) - stateRank(b.state) || (a.priority || 9) - (b.priority || 9) || new Date(b.changed) - new Date(a.changed));
+  const groups = new Map(); rows.forEach(w => { const k = w.state; if (!groups.has(k)) groups.set(k, []); groups.get(k).push(w); });
+  const body = [...groups.entries()].sort((a, b) => stateRank(a[0]) - stateRank(b[0])).map(([state, ws]) => el('div', {},
+    el('div', { className: 'wgroup' }, `${state} · ${ws.length}`),
+    ws.map(w => { const r = el('div', { className: 'witem' + (ui.sel === w.id ? ' sel' : ''), tabIndex: 0, role: 'button' },
+      el('div', { className: 'witem-h' }, typePill(w.type), el('span', { className: 'mono muted' }, '#' + w.id),
+        w.priority ? el('span', { className: 'chip', title: 'Priority' }, 'P' + w.priority) : null,
+        w.severity ? el('span', { className: 'chip', title: 'Severity' }, w.severity.replace(/^\d - /, '')) : null,
+        inSprint(w) ? el('span', { className: 'chip', title: data.sprint.path }, 'sprint') : null,
+        el('div', { style: { flex: 1 } }), el('span', { className: 'muted', style: { fontSize: '12px' } }, ago(w.changed))),
+      el('div', { className: 'witem-t' }, w.title),
+      w.tags ? el('div', { className: 'muted', style: { fontSize: '11.5px' } }, w.tags) : null);
+      r.onclick = () => openItem(w.id); r.onkeydown = (e) => { if (e.key === 'Enter') openItem(w.id); }; return r; })));
+  $('#listCard').replaceChildren(rows.length ? el('div', { className: 'wlist' }, body) : el('div', { className: 'empty' }, el('div', { className: 'big' }, 'Nothing here'), 'No open items match.'));
+}
+
+/* ---------------- detail ---------------- */
+async function openItem(id) {
+  ui.sel = id; renderList(); history.replaceState(null, '', '?id=' + id);
+  const box = $('#detail'); box.replaceChildren(el('div', { className: 'empty' }, el('span', { className: 'spinner dark' }), ' Loading #' + id + '…'));
+  try { const d = await api('/api/work/item?id=' + id); if (ui.sel === id) box.replaceChildren(...detailView(d)); }
+  catch (e) { box.replaceChildren(el('div', { className: 'card-b err' }, '⚠ ' + e.message)); }
+}
+
+function textBlock(title, text) {
+  if (!text) return null;
+  return el('div', { className: 'wsec' }, el('div', { className: 'wph' }, title), el('pre', { className: 'wtext' }, text));
+}
+
+function detailView(d) {
+  const out = [];
+  out.push(el('div', { className: 'card-h' }, typePill(d.type), el('h2', { style: { flex: 1 } }, `#${d.id} ${d.title}`),
+    el('a', { className: 'iconbtn', href: d.url, target: '_blank', rel: 'noopener', style: { textDecoration: 'none' } }, 'Open in Azure ↗')));
+  out.push(el('div', { className: 'card-b kvline' },
+    el('span', {}, el('span', { className: 'muted' }, 'state '), el('b', {}, d.state)), el('span', {}, el('span', { className: 'muted' }, 'sprint '), d.iteration),
+    d.priority ? el('span', {}, el('span', { className: 'muted' }, 'priority '), d.priority) : null, d.severity ? el('span', {}, el('span', { className: 'muted' }, 'severity '), d.severity) : null,
+    el('span', {}, el('span', { className: 'muted' }, 'created by '), d.createdBy), d.tags ? el('span', {}, el('span', { className: 'muted' }, 'tags '), d.tags) : null));
+  const b = el('div', { className: 'card-b', style: { display: 'grid', gap: '16px' } }); out.push(b);
+  b.append(fixInGit(d));
+  if (d.type === 'Bug' || d.trace) b.append(suggestedFix(d));
+  b.append(...[textBlock('Repro steps', d.repro), textBlock('Description', d.description), textBlock('Acceptance criteria', d.acceptance), textBlock('System info', d.systemInfo)].filter(Boolean));
+  if (d.comments.length) b.append(el('div', { className: 'wsec' }, el('div', { className: 'wph' }, `Discussion (${d.comments.length})`),
+    d.comments.map(c => el('div', { className: 'wcomment' }, el('div', { className: 'muted', style: { fontSize: '12px' } }, `${c.by} · ${fmtDate(c.date)}`), el('pre', { className: 'wtext' }, c.text)))));
+  return out;
+}
+
+/* the fix in git: PRs and commits linked in Azure, plus local commits/branches that mention the ID */
+function fixInGit(d) {
+  const L = d.links, loc = d.local;
+  const rows = [];
+  const PR = { completed: ['var(--good)', '✓', 'merged'], active: ['var(--accent)', '↻', 'open'], abandoned: ['var(--neutral)', '–', 'abandoned'] };
+  for (const p of L.prs) { const [c, i, lab] = PR[p.status] || PR.active;
+    rows.push(el('div', { className: 'gitrow' }, el('span', { className: 'pill', style: { '--c': c } }, el('span', { className: 'ico', textContent: i }), `PR ${lab}`),
+      el('div', {}, el('a', { href: p.url, target: '_blank', rel: 'noopener' }, `!${p.id} ${p.title}`),
+        el('div', { className: 'muted', style: { fontSize: '12px' } }, `${p.source} → ${p.target} · ${p.repo} · ${p.by} · ${fmtDate(p.created)}${p.closed ? ' · closed ' + fmtDate(p.closed) : ''}`)),
+      p.mergeCommit ? diffToggle(p.mergeCommit) : null)); }
+  const seen = new Set();
+  for (const c of L.commits) { seen.add(c.hash);
+    rows.push(commitRow(c.hash, c.subject, c.author, c.date, c.changes ? `${c.changes.Edit || 0} edited · ${c.changes.Add || 0} added · ${c.changes.Delete || 0} deleted` : '', 'linked', c.url)); }
+  for (const c of loc.commits) if (!seen.has(c.hash)) rows.push(commitRow(c.hash, c.subject, c.author, c.date, c.stat || '', 'mentions #' + d.id));
+  for (const br of [...L.branches.map(x => ({ name: x.name, src: 'linked' })), ...loc.branches.map(x => ({ name: x.name, src: 'local' }))])
+    rows.push(el('div', { className: 'gitrow' }, el('span', { className: 'pill', style: { '--c': 'var(--s4)' } }, el('span', { className: 'ico dark-ink', textContent: '⎇' }), 'branch'),
+      el('div', { className: 'mono' }, br.name, copyBtn(br.name)), el('span', { className: 'muted', style: { fontSize: '12px' } }, br.src)));
+  const notes = [...L.errors.map(e => el('div', { className: 'err' }, '⚠ ' + e)), loc.error ? el('div', { className: 'err' }, '⚠ local git: ' + loc.error) : null,
+    loc.reachedFrom && loc.reachedFrom.length ? el('div', { className: 'muted', style: { fontSize: '12.5px' } }, 'Fix commits are in: ', loc.reachedFrom.join(', ')) : null];
+  return el('div', { className: 'wsec' }, el('div', { className: 'wph' }, 'Fix in git'),
+    rows.length ? el('div', { className: 'gitrows' }, rows) : el('div', { className: 'muted' }, `No linked PR or commit, and no commit in ${d.repo} mentions ${d.id}. (git fetch to see colleagues' work.)`),
+    ...notes);
+}
+function commitRow(hash, subject, author, date, stat, src, url) {
+  return el('div', { className: 'gitrow' }, el('span', { className: 'pill', style: { '--c': 'var(--s3)' } }, el('span', { className: 'ico', textContent: '●' }), 'commit'),
+    el('div', {}, el('span', { className: 'mono' }, hash.slice(0, 9)), copyBtn(hash), ' ', url ? el('a', { href: url, target: '_blank', rel: 'noopener' }, subject) : el('b', {}, subject),
+      el('div', { className: 'muted', style: { fontSize: '12px' } }, `${author} · ${fmtDate(date)}${stat ? ' · ' + stat : ''} · ${src}`)),
+    diffToggle(hash));
+}
+function diffToggle(hash) {
+  const box = el('div', { className: 'gitdiff' });
+  const b = el('button', { type: 'button', className: 'linkbtn' }, 'Show diff');
+  b.onclick = async () => {
+    if (box.firstChild) { box.replaceChildren(); b.textContent = 'Show diff'; return; }
+    b.textContent = 'Loading…';
+    try { const r = await api('/api/work/diff?hash=' + hash); box.replaceChildren(patchView(r.text)); b.textContent = 'Hide diff'; }
+    catch (e) { box.replaceChildren(el('div', { className: 'err' }, '⚠ ' + e.message)); b.textContent = 'Show diff'; }
+  };
+  return el('div', { style: { gridColumn: '1 / -1' } }, b, box);
+}
+function patchView(text) {
+  return el('div', { className: 'diff' }, el('div', { className: 'diff-b' }, text.split('\n').map(l =>
+    el('div', { className: 'dl ' + (/^\+(?!\+\+)/.test(l) ? 'add' : /^-(?!--)/.test(l) ? 'del' : /^(diff --git|@@)/.test(l) ? 'hunk' : '') }, l || ' '))));
+}
+
+/* stack trace in the bug -> code line + the local rule-based Suggest fix (code.js) */
+function suggestedFix(d) {
+  const t = d.trace;
+  const head = el('div', { className: 'wph' }, 'Suggested fix');
+  if (!t) return el('div', { className: 'wsec' }, head, el('div', { className: 'muted' }, 'No Java stack trace in the bug text or discussion, so the code line is unknown. Paste the exception and its "at com.tt…" lines into the bug to get a suggestion here.'));
+  const parts = [head, el('div', {}, el('b', { className: 'mono' }, t.fullType || 'Stack trace'), t.msg ? el('span', { className: 'ink2' }, ': ' + t.msg) : null,
+    el('div', { className: 'muted', style: { fontSize: '12px' } }, `${t.frames.length} frames, ${t.appFrames} in odeysys code`))];
+  if (!t.top) parts.push(el('div', { className: 'muted' }, 'The exception has no "at …(File.java:N)" lines, so the code line is unknown.'));
+  else parts.push(codeView(t.code, t.top, null, { type: t.type, msg: t.msg, method: t.top.methodName, frames: t.frames }));
+  return el('div', { className: 'wsec' }, ...parts);
+}
+
+load();
+</script>
+</body>
+</html>

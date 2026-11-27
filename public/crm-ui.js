@@ -66,6 +66,7 @@ async function createTicket(data) {
              ['/crm?view=tickets', 'Tickets', '☰', (p.startsWith('/crm') || p === '/tickets') && view === 'tickets', 'open']]],
     ['Investigate', [['/', 'Cases', '⌕', p === '/' || p === '/index.html'], ['/failures', 'Booking failures', '✕', p.startsWith('/failures')],
                      ['/exceptions', 'Exceptions', '⚡', p.startsWith('/exceptions')]]],
+    ['Engineering', [['/performance', 'Performance', '⏱', p.startsWith('/performance')], ['/work', 'My work', '☑', p.startsWith('/work')]]],
   ];
   const search = el('input', { type: 'search', placeholder: 'Ticket, ref, PNR, session…', 'aria-label': 'Search tickets, refs, PNRs, sessions' });
   search.onkeydown = (e) => { if (e.key === 'Enter') smartGo(search.value); };

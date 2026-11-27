@@ -230,3 +230,53 @@ Notes:
 - Payment-gateway logs carry no agency code; agency-only searches list the agency's `processMakePayment` sessions.
 - Bank callbacks may run under a different `correlationId` and won't appear in the session timeline.
 - Uses the OpenSearch Dashboards internal search API (`/internal/search/opensearch`), which can change between OSD versions.
+
+## Performance page
+
+`http://127.0.0.1:8787/performance` (tab **Performance**): times the Odeysys REST endpoints on a **local WildFly** and
+suggests fixes. Start with `start.ps1 -Perf` (asks for the local admin/portal URLs and a test login, kept in memory only).
+
+- **Endpoints** are read from the `@RestController` classes of `odeysysadmin-tt` and `odeysysportal-tt` in `GIT_REF`
+  (class + method `@RequestMapping`/`@GetMapping`…, `String` constants resolved, DispatcherServlet prefix from `web.xml`).
+- **What is called:** read-only GETs only. GETs whose path or method name contains a change verb (delete, save, cancel,
+  book, issue, pay…) and every POST/PUT/DELETE are skipped. To time those (e.g. airline search) list them in
+  `perf.endpoints.json` with test data – copy `perf.endpoints.example.json`. The same file holds the login call and
+  sample values (`params`) for `{id}` path variables and required request parameters.
+- **Safety:** runs are refused unless the base URL is localhost/127.0.0.1 (`PERF_ALLOW_REMOTE=1` overrides). The page can
+  only start endpoints the server discovered or that are in the config file, never arbitrary URLs.
+- **Timing:** one first call (cold), then N timed calls one after another (1–4 in parallel if you choose). *Typical* =
+  median of the timed calls; also first byte, size, compression and row count of the largest JSON list.
+- **Suggested fixes:** *measured* (slow, cold start, unstable, large or uncompressed response, too many rows, errors,
+  not logged in) and *code pattern* for endpoints over the target: the handler plus the service/DAO methods it calls
+  (2 levels) are checked for DB calls in loops (N+1), external calls in loops or in sequence, `JAXBContext.newInstance`
+  / `new ObjectMapper()` per call, `Thread.sleep`, unpaged `findAll`/`list()`, counting by loading rows, payload
+  logging at INFO, `synchronized`, reference data read without cache. Code patterns are likely causes, not proof.
+- **Before/after:** *Save as baseline*, apply a fix, run again: the *vs baseline* column shows the change. Results are
+  stored in `perf-results/` (git-ignored). Env: `PERF_ADMIN_URL`, `PERF_PORTAL_URL`, `PERF_USER`, `PERF_PASS`, `PERF_FILE`.
+
+### Values from the local DB and read-only POSTs
+
+`start.ps1 -Perf` also asks for a local MySQL schema and a **read-only** user (`PERF_DB_HOST/PORT/NAME/USER/PASS`, Enter
+at the schema prompt skips it). **⛁ Fill values from DB** reads `information_schema` and one value per needed column
+(`SELECT … LIMIT 1`, read-only session, 3 s limit per query) through MySQL Shell (`mysqlsh`, or set `MYSQLSH`).
+Values are matched by name: `airlineId` → primary key of the airline table, `{id}` → primary key of the table named
+in the path (`/Master2/airline/{id}`), other names only when the column exists in ≤ 3 tables. Order: value typed on the
+page > DB > generated (date ranges, paging). Cached in `perf-results/dbvalues.json`.
+POST endpoints whose name only reads (search, list, filter, report, export…) and has no change word are now called
+with a body built from the `@RequestBody` DTO (unknown fields left out). Login, OTP, register, password and verify
+endpoints are never called.
+
+## My work (Azure DevOps)
+
+`http://127.0.0.1:8787/work` (tab **My work**): your open Azure DevOps tasks and bugs (assigned to the PAT's user,
+not Closed/Done/Removed), grouped by state, current sprint first. Start with `start.ps1 -Azure`; the PAT needs
+**Work Items (Read)** and **Code (Read)**; `AZDO_TEAM` names the team whose current sprint is marked. Read-only: the
+page never changes a work item.
+
+Click an item to see repro steps, description and discussion (as plain text), and for bugs:
+- **Fix in git** – pull requests, commits and branches linked to the item in Azure DevOps, plus commits on any fetched
+  branch of `REPO_DIR` whose message mentions the ID and branches whose name contains it. *Show diff* shows the
+  commit from the local repo (`git fetch` first to see colleagues' work).
+- **Suggested fix** – when the bug text or discussion contains a Java stack trace, the first odeysys frame's code line
+  is shown with the same local rule-based **💡 Suggest fix** as the Exceptions page (nothing is sent anywhere).
+The code viewer and Suggest fix panel now live in `public/code.js`, shared by both pages.

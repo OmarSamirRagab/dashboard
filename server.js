@@ -140,11 +140,42 @@ const server = http.createServer(async (req, res) => {
     }
     if (u.pathname === '/api/doc' && q.id) return send(res, 200, await doc(q.id, q.index));
     if (u.pathname === '/api/failure-explain' && q.cid) return send(res, 200, await require('./lib/failexplain').explainFailure({ cid: q.cid, time: q.time, supplier: q.supplier, reason: q.reason }));
+    if (u.pathname.startsWith('/api/work/')) {
+      const work = require('./lib/work');
+      try {
+        if (u.pathname === '/api/work/items') return send(res, 200, await work.list());
+        if (u.pathname === '/api/work/item' && /^\d+$/.test(q.id || '')) return send(res, 200, await work.detail(Number(q.id)));
+        if (u.pathname === '/api/work/diff' && q.hash) return send(res, 200, await work.commitDiff(q.hash));
+      } catch (e) { console.error(`[server][${u.pathname}] ${e.message}`); return send(res, e.status || 500, { error: e.message }); }
+    }
+    if (u.pathname.startsWith('/api/perf/')) {
+      const perf = require('./lib/perf');
+      try {
+        if (u.pathname === '/api/perf/endpoints') return send(res, 200, await perf.discover(q.refresh === '1'));
+        if (u.pathname === '/api/perf/status') return send(res, 200, perf.status());
+        if (u.pathname === '/api/perf/report') {
+          const th = { warn: Math.max(100, Number(q.warn) || 1000), crit: Math.max(200, Number(q.crit) || 5000) };
+          return send(res, 200, await perf.report(['last', 'baseline', 'current'].includes(q.run) ? q.run : 'current', th));
+        }
+        if (u.pathname === '/api/perf/analyze' && q.id) return send(res, 200, await perf.analyze(q.id));
+        if (req.method === 'POST') {
+          // JSON only: forces a CORS preflight, so other web pages cannot start runs against the local backend.
+          if (!/^application\/json/.test(req.headers['content-type'] || '')) return send(res, 415, { error: 'JSON required' });
+          const b = await readBody(req);
+          if (u.pathname === '/api/perf/run') return send(res, 200, await perf.startRun(b));
+          if (u.pathname === '/api/perf/stop') return send(res, 200, perf.stopRun());
+          if (u.pathname === '/api/perf/baseline') return send(res, 200, perf.saveBaseline());
+          if (u.pathname === '/api/perf/params') return send(res, 200, await perf.saveParams(b.params));
+          if (u.pathname === '/api/perf/dbfill') return send(res, 200, await perf.fillFromDb());
+        }
+      } catch (e) { console.error(`[server][${u.pathname}] ${e.message}`); return send(res, e.status || 500, { error: e.message }); }
+    }
     if (u.pathname === '/api/config') return send(res, 200, { osdUrl: OSD_URL, tenant: TENANT, indexPatternId: INDEX_PATTERN_ID,
       fix: { worktree: fixer.FIX_WORKTREE, gitRef: GIT_REF }, azdo: require('./azdo').settings() });
     const STATIC = { '/': 'index.html', '/index.html': 'index.html', '/exceptions': 'exceptions.html', '/exceptions.html': 'exceptions.html',
       '/failures': 'failures.html', '/failures.html': 'failures.html', '/crm': 'crm.html', '/crm.html': 'crm.html', '/tickets': 'crm.html',
-      '/app.css': 'app.css', '/common.js': 'common.js', '/crm.css': 'crm.css', '/crm-ui.js': 'crm-ui.js' };
+      '/performance': 'performance.html', '/performance.html': 'performance.html', '/work': 'work.html', '/work.html': 'work.html',
+      '/app.css': 'app.css', '/common.js': 'common.js', '/crm.css': 'crm.css', '/crm-ui.js': 'crm-ui.js', '/code.js': 'code.js' };
     if (STATIC[u.pathname]) {
       const f = STATIC[u.pathname]; const type = f.endsWith('.css') ? 'text/css' : f.endsWith('.js') ? 'text/javascript' : 'text/html';
       res.writeHead(200, { 'Content-Type': `${type}; charset=utf-8`, 'Cache-Control': 'no-cache' });
