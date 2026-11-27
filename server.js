@@ -97,6 +97,14 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, await codeFor({ className: q.cls, fileName: q.file, lineNumber: Number(q.line) }, q.host, 10));
     }
     if (u.pathname === '/api/doc' && q.id) return send(res, 200, await doc(q.id, q.index));
+    if (u.pathname.startsWith('/api/work/')) {
+      const work = require('./lib/work');
+      try {
+        if (u.pathname === '/api/work/items') return send(res, 200, await work.list());
+        if (u.pathname === '/api/work/item' && /^\d+$/.test(q.id || '')) return send(res, 200, await work.detail(Number(q.id)));
+        if (u.pathname === '/api/work/diff' && q.hash) return send(res, 200, await work.commitDiff(q.hash));
+      } catch (e) { console.error(`[server][${u.pathname}] ${e.message}`); return send(res, e.status || 500, { error: e.message }); }
+    }
     if (u.pathname.startsWith('/api/perf/')) {
       const perf = require('./lib/perf');
       try {
@@ -122,8 +130,8 @@ const server = http.createServer(async (req, res) => {
     if (u.pathname === '/api/config') return send(res, 200, { osdUrl: OSD_URL, tenant: TENANT, indexPatternId: INDEX_PATTERN_ID,
       fix: { worktree: fixer.FIX_WORKTREE, gitRef: GIT_REF }, azdo: require('./azdo').settings() });
     const STATIC = { '/': 'index.html', '/index.html': 'index.html', '/exceptions': 'exceptions.html', '/exceptions.html': 'exceptions.html',
-      '/failures': 'failures.html', '/failures.html': 'failures.html', '/performance': 'performance.html', '/performance.html': 'performance.html',
-      '/app.css': 'app.css', '/common.js': 'common.js' };
+      '/failures': 'failures.html', '/failures.html': 'failures.html', '/performance': 'performance.html', '/performance.html': 'performance.html', '/work': 'work.html', '/work.html': 'work.html',
+      '/app.css': 'app.css', '/common.js': 'common.js', '/code.js': 'code.js' };
     if (STATIC[u.pathname]) {
       const f = STATIC[u.pathname]; const type = f.endsWith('.css') ? 'text/css' : f.endsWith('.js') ? 'text/javascript' : 'text/html';
       res.writeHead(200, { 'Content-Type': `${type}; charset=utf-8`, 'Cache-Control': 'no-cache' });

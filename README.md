@@ -221,3 +221,18 @@ page > DB > generated (date ranges, paging). Cached in `perf-results/dbvalues.js
 POST endpoints whose name only reads (search, list, filter, report, export…) and has no change word are now called
 with a body built from the `@RequestBody` DTO (unknown fields left out). Login, OTP, register, password and verify
 endpoints are never called.
+
+## My work (Azure DevOps)
+
+`http://127.0.0.1:8787/work` (tab **My work**): your open Azure DevOps tasks and bugs (assigned to the PAT's user,
+not Closed/Done/Removed), grouped by state, current sprint first. Start with `start.ps1 -Azure`; the PAT needs
+**Work Items (Read)** and **Code (Read)**; `AZDO_TEAM` names the team whose current sprint is marked. Read-only: the
+page never changes a work item.
+
+Click an item to see repro steps, description and discussion (as plain text), and for bugs:
+- **Fix in git** – pull requests, commits and branches linked to the item in Azure DevOps, plus commits on any fetched
+  branch of `REPO_DIR` whose message mentions the ID and branches whose name contains it. *Show diff* shows the
+  commit from the local repo (`git fetch` first to see colleagues' work).
+- **Suggested fix** – when the bug text or discussion contains a Java stack trace, the first odeysys frame's code line
+  is shown with the same local rule-based **💡 Suggest fix** as the Exceptions page (nothing is sent anywhere).
+The code viewer and Suggest fix panel now live in `public/code.js`, shared by both pages.

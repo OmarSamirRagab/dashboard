@@ -23,7 +23,8 @@ if (-not $env:OSD_PASS) { $env:OSD_PASS = Read-Secret 'OpenSearch password' }
 if ($Azure) {
     if (-not $env:AZDO_ORG_URL) { $env:AZDO_ORG_URL = Read-Host -Prompt 'Azure DevOps organization URL (https://dev.azure.com/<org>)' }
     if (-not $env:AZDO_PROJECT) { $env:AZDO_PROJECT = Read-Host -Prompt 'Azure DevOps project' }
-    if (-not $env:AZDO_PAT)     { $env:AZDO_PAT = Read-Secret 'Azure DevOps personal access token (Work Items Read & Write)' }
+    if (-not $env:AZDO_PAT)     { $env:AZDO_PAT = Read-Secret 'Azure DevOps personal access token (Work Items Read & Write, Code Read)' }
+    if (-not $env:AZDO_TEAM)    { $env:AZDO_TEAM = Read-Host -Prompt 'Azure DevOps team for the current sprint (Enter = "<project> Team")' }
     if (-not $env:AZDO_TEAM_LEADER) { $env:AZDO_TEAM_LEADER = Read-Host -Prompt 'Team leader e-mail (optional, Enter to skip)' }
 }
 
